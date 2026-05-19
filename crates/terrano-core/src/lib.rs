@@ -5,10 +5,12 @@
 
 mod algebra;
 mod error;
+mod hydrology;
 mod raster;
 mod terrain;
 
 pub use algebra::{BinaryOp, UnaryOp, reclassify};
 pub use error::Error;
+pub use hydrology::{flow_accumulation, flow_direction};
 pub use raster::Raster;
 pub use terrain::{aspect, hillshade, slope};
