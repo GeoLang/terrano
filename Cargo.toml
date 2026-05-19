@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/TileTopia-HQ/terrano"
+rust-version = "1.85"
+
+[workspace.dependencies]
+terrano-core = { path = "crates/terrano-core" }

@@ -1,0 +1,13 @@
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("dimension mismatch: expected {expected} cells, got {got}")]
+    DimensionMismatch { expected: usize, got: usize },
+
+    #[error("rasters have incompatible dimensions")]
+    IncompatibleRasters,
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}

@@ -1,0 +1,16 @@
+[package]
+name = "terrano-cli"
+description = "CLI for the Terrano raster/terrain analysis engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "terrano"
+path = "src/main.rs"
+
+[dependencies]
+terrano-core.workspace = true
+clap = { version = "4", features = ["derive"] }
