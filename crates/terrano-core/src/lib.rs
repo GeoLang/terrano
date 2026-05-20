@@ -4,12 +4,14 @@
 //! and hydrological analysis.
 
 mod algebra;
+mod contour;
 mod error;
 mod hydrology;
 mod raster;
 mod terrain;
 
 pub use algebra::{BinaryOp, UnaryOp, reclassify};
+pub use contour::{ContourLine, ContourSegment, contours, fill_sinks};
 pub use error::Error;
 pub use hydrology::{flow_accumulation, flow_direction};
 pub use raster::Raster;
