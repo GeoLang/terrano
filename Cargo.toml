@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/GeoLang/terrano"
-authors = ["TileTopia <tiletopia@proton.me>"]
+authors = ["GeoLang <tiletopia@proton.me>"]
 description = "Terrain analysis — hillshade, slope, aspect, and contours"
 rust-version = "1.85"
 
