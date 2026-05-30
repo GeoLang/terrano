@@ -51,7 +51,7 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../terrano-${{ matrix.target }}.tar.gz terrano
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: terrano-${{ matrix.target }}
           path: terrano-${{ matrix.target }}.tar.gz
