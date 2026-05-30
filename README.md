@@ -1,8 +1,8 @@
 # Terrano
 
-Raster algebra and terrain analysis engine for the TileTopia-HQ GIS stack.
+Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 
-[Documentation](https://tiletopia-hq.github.io/terrano/) · [GitHub](https://github.com/TileTopia-HQ/terrano)
+[Documentation](https://geolang.github.io/terrano/) · [GitHub](https://github.com/GeoLang/terrano)
 
 ## Features
 
