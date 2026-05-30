@@ -9,3 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 thiserror = "2"
+
+[dev-dependencies]
+criterion.workspace = true

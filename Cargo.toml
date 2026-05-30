@@ -12,4 +12,5 @@ description = "Terrain analysis — hillshade, slope, aspect, and contours"
 rust-version = "1.85"
 
 [workspace.dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 terrano-core = { path = "crates/terrano-core" }
