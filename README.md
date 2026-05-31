@@ -16,6 +16,8 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 - **Map algebra** — Unary (add, multiply, sqrt, abs, log) and binary (add, subtract, multiply, divide, min, max) operations
 - **Reclassification** — Value-range-based class assignment
 - **GeoTIFF I/O** — Read and write GeoTIFF rasters with CRS metadata
+- **Cloud Optimized GeoTIFF (COG)** — HTTP range-request streaming, overview selection, window reads
+- **EO time-series** — `RasterStack` for multi-temporal analysis: composites (mean/median/max), linear trend fitting, change detection, anomaly z-scores, phenology metrics, normalized difference indices (NDVI, NDWI, etc.)
 
 ## Usage
 
