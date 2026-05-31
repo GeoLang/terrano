@@ -4,6 +4,7 @@
 //! and hydrological analysis.
 
 mod algebra;
+mod cog;
 mod contour;
 mod error;
 mod geotiff;
@@ -15,6 +16,7 @@ mod terrain;
 mod watershed;
 
 pub use algebra::{BinaryOp, UnaryOp, reclassify};
+pub use cog::{CogParams, Overview, extract_tile, generate_overviews, write_cog};
 pub use contour::{ContourLine, ContourSegment, contours, fill_sinks};
 pub use error::Error;
 pub use geotiff::{GeoTiffMetadata, read_geotiff, write_geotiff};
