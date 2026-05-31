@@ -1,5 +1,8 @@
 # Terrano
 
+[![CI](https://github.com/GeoLang/terrano/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/terrano/actions)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+
 Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 
 [Documentation](https://geolang.github.io/terrano/) · [GitHub](https://github.com/GeoLang/terrano)
