@@ -8,6 +8,9 @@ pub enum Error {
     #[error("format error: {0}")]
     Format(String),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("rasters have incompatible dimensions")]
     IncompatibleRasters,
 
