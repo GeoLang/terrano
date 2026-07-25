@@ -62,4 +62,6 @@ terrano watershed --input dem.tif --pour-points points.geojson --output basins.t
 
 ## License
 
-AGPL-3.0-or-later
+AGPL-3.0-or-later, see [LICENSE](LICENSE).
+
+Copyright (C) 2026 Grok Image Compression Inc.
