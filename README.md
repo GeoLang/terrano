@@ -20,6 +20,7 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 - **Reclassification** — Value-range-based class assignment
 - **GeoTIFF I/O** — Read and write GeoTIFF rasters with CRS metadata
 - **Cloud Optimized GeoTIFF (COG)** — HTTP range-request streaming, overview selection, window reads
+- **GRIB2 and NetCDF** — message scanning and variable reads for gridded weather and climate data
 - **EO time-series** — `RasterStack` for multi-temporal analysis: composites (mean/median/max), linear trend fitting, change detection, anomaly z-scores, phenology metrics, normalized difference indices (NDVI, NDWI, etc.)
 
 ## Usage
@@ -30,34 +31,36 @@ use terrano_core::{
     flow_accumulation, watershed, read_geotiff, write_geotiff,
 };
 
-// Read a DEM
-let dem = read_geotiff("elevation.tif").unwrap();
+// Read a DEM from bytes
+let bytes = std::fs::read("elevation.tif").unwrap();
+let (dem, meta) = read_geotiff(&bytes).unwrap();
 
 // Terrain derivatives
 let slopes = slope(&dem);
 let hs = hillshade(&dem, 315.0, 45.0);
 let asp = aspect(&dem);
 
-// Contour lines at 10m intervals
-let lines = contours(&dem, 10.0);
+// Contour lines every 10m, starting at 0
+let lines = contours(&dem, 10.0, 0.0);
 
 // Hydrology
 let flow_dir = flow_direction(&dem);
 let accumulation = flow_accumulation(&flow_dir);
-let basins = watershed(&flow_dir, &pour_points);
+let basins = watershed(&flow_dir);
 
 // Write output
-write_geotiff("slopes.tif", &slopes, &metadata).unwrap();
+let mut out = std::fs::File::create("slopes.tif").unwrap();
+write_geotiff(&slopes, &meta, &mut out).unwrap();
 ```
 
 ## CLI
 
+The CLI is a demo harness over a synthetic DEM, it does not read or write raster files yet.
+Use `terrano-core` directly for real work.
+
 ```sh
-terrano hillshade --input dem.tif --azimuth 315 --altitude 45 --output hillshade.tif
-terrano slope --input dem.tif --output slope.tif
-terrano contour --input dem.tif --interval 10 --output contours.geojson
-terrano flow --input dem.tif --output flow_acc.tif
-terrano watershed --input dem.tif --pour-points points.geojson --output basins.tif
+terrano stats --width 10 --height 10
+terrano hillshade --azimuth 315 --altitude 45
 ```
 
 ## License
