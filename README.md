@@ -19,6 +19,7 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 - **Map algebra** — Unary (add, multiply, sqrt, abs, log) and binary (add, subtract, multiply, divide, min, max) operations
 - **Reclassification** — Value-range-based class assignment
 - **GeoTIFF I/O** — Read and write GeoTIFF rasters with CRS metadata
+- **Multi-band rasters** — `BandedRaster` holds RGB/RGBA or any band set on one grid, written and read as a multi-band GeoTIFF with 8-bit or 64-bit float samples
 - **Cloud Optimized GeoTIFF (COG)** — HTTP range-request streaming, overview selection, window reads
 - **GRIB2 and NetCDF** — message scanning and variable reads for gridded weather and climate data
 - **EO time-series** — `RasterStack` for multi-temporal analysis: composites (mean/median/max), linear trend fitting, change detection, anomaly z-scores, phenology metrics, normalized difference indices (NDVI, NDWI, etc.)

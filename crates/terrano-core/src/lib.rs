@@ -4,6 +4,7 @@
 //! and hydrological analysis.
 
 mod algebra;
+mod banded;
 mod cog;
 mod contour;
 mod error;
@@ -17,10 +18,14 @@ mod timeseries;
 mod watershed;
 
 pub use algebra::{BinaryOp, UnaryOp, reclassify};
+pub use banded::BandedRaster;
 pub use cog::{CogParams, Overview, extract_tile, generate_overviews, write_cog};
 pub use contour::{ContourLine, ContourSegment, contours, fill_sinks};
 pub use error::Error;
-pub use geotiff::{GeoTiffMetadata, read_geotiff, write_geotiff};
+pub use geotiff::{
+    GeoTiffMetadata, SampleFormat, read_geotiff, read_geotiff_bands, write_geotiff,
+    write_geotiff_bands,
+};
 pub use hydrology::{flow_accumulation, flow_direction};
 pub use raster::Raster;
 pub use terrain::{aspect, hillshade, slope};

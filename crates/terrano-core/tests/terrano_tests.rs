@@ -1,8 +1,9 @@
 // Comprehensive integration tests for terrano-core.
 
 use terrano_core::{
-    BinaryOp, Raster, UnaryOp, aspect, contours, flow_accumulation, flow_direction, hillshade,
-    reclassify, slope,
+    BandedRaster, BinaryOp, GeoTiffMetadata, Raster, SampleFormat, UnaryOp, aspect, contours,
+    flow_accumulation, flow_direction, hillshade, read_geotiff_bands, reclassify, slope,
+    write_geotiff, write_geotiff_bands,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -325,4 +326,91 @@ fn test_flow_accumulation_basic() {
             }
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Multi-band rasters
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Bytes produced by `write_geotiff` before multi-band support landed. Fenestra
+/// reads and writes these, so the single-band output must not shift.
+const GOLDEN_SINGLE_BAND: &[u8] = include_bytes!("fixtures/single_band_f64.tif");
+
+#[test]
+fn test_write_geotiff_single_band_bytes_unchanged() {
+    let raster = Raster::from_vec(
+        3,
+        2,
+        vec![1.5, -2.25, 3.0, 4.125, -9999.0, 6.5],
+        10.0,
+        -9999.0,
+    )
+    .unwrap();
+    let meta = GeoTiffMetadata {
+        origin_x: 500000.0,
+        origin_y: 4500000.0,
+        pixel_width: 10.0,
+        pixel_height: 10.0,
+        epsg: 32632,
+    };
+
+    let mut buf = Vec::new();
+    write_geotiff(&raster, &meta, &mut buf).unwrap();
+    assert_eq!(buf, GOLDEN_SINGLE_BAND);
+}
+
+#[test]
+fn test_banded_band_feeds_hillshade_identically() {
+    let dem = sloped_dem();
+    let banded = BandedRaster::new(vec![Raster::new(5, 5, 10.0, -9999.0), dem.clone()]).unwrap();
+
+    let direct = hillshade(&dem, 315.0, 45.0);
+    let per_band = hillshade(banded.band(1).unwrap(), 315.0, 45.0);
+    assert_eq!(per_band.data(), direct.data());
+}
+
+#[test]
+fn test_banded_rgb_geotiff_roundtrip() {
+    let bands: Vec<Vec<f64>> = vec![
+        (0..25).map(|i| (i * 10 % 256) as f64).collect(),
+        (0..25).map(|i| (255 - i * 3) as f64).collect(),
+        (0..25).map(|i| (i % 2 * 255) as f64).collect(),
+    ];
+    let raster = BandedRaster::with_names(
+        bands
+            .iter()
+            .map(|v| Raster::from_vec(5, 5, v.clone(), 0.5, -9999.0).unwrap())
+            .collect(),
+        vec!["red".into(), "green".into(), "blue".into()],
+    )
+    .unwrap();
+    let meta = GeoTiffMetadata {
+        origin_x: -122.5,
+        origin_y: 37.8,
+        pixel_width: 0.5,
+        pixel_height: 0.5,
+        epsg: 4326,
+    };
+
+    let mut buf = Vec::new();
+    write_geotiff_bands(&raster, &meta, SampleFormat::U8, &mut buf).unwrap();
+    let (read, read_meta) = read_geotiff_bands(&buf).unwrap();
+
+    assert_eq!(read.band_count(), 3);
+    assert_eq!((read.width(), read.height()), (5, 5));
+    assert_eq!(read.cell_size(), 0.5);
+    assert_eq!(read_meta.epsg, 4326);
+    assert_eq!(read_meta.origin_x, -122.5);
+    for (b, values) in bands.iter().enumerate() {
+        assert_eq!(read.band(b).unwrap().data(), values.as_slice());
+    }
+}
+
+#[test]
+fn test_banded_mismatched_band_sizes_rejected() {
+    let result = BandedRaster::new(vec![
+        Raster::new(4, 4, 1.0, -9999.0),
+        Raster::new(4, 3, 1.0, -9999.0),
+    ]);
+    assert!(result.is_err());
 }
