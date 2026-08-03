@@ -4,8 +4,10 @@
 //! the start of the file, and reads them back windowed: [`CogReader`] over
 //! a [`RangeRead`] source fetches only the tiles a window touches, so a
 //! `Range`-request http transport streams remote files without downloading
-//! them. The read side covers the subset the writer produces: uncompressed,
-//! tiled, single-band 64-bit float.
+//! them. The read side covers real-world single-band cogs: uncompressed or
+//! deflate tiles, horizontal and floating-point predictors, integer and
+//! float sample types (decoded to f64, nodata mapped to NaN). The writer
+//! produces 64-bit float tiles, raw or deflate.
 //!
 //! COG files follow the standard described at <https://www.cogeo.org/>.
 
@@ -33,6 +35,8 @@ pub struct CogParams {
     pub pixel_width: f64,
     /// Pixel height in map units.
     pub pixel_height: f64,
+    /// Compress tiles with zlib deflate.
+    pub deflate: bool,
 }
 
 impl Default for CogParams {
@@ -46,6 +50,7 @@ impl Default for CogParams {
             origin_y: 0.0,
             pixel_width: 1.0,
             pixel_height: 1.0,
+            deflate: false,
         }
     }
 }
@@ -155,6 +160,16 @@ pub fn write_cog<W: Write + Seek>(
             params.tile_width as usize,
             params.tile_height as usize,
         ));
+    }
+    if params.deflate {
+        for tiles in &mut all_tile_data {
+            for tile in tiles.iter_mut() {
+                let mut enc =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(tile)?;
+                *tile = enc.finish()?;
+            }
+        }
     }
 
     // per-ifd byte footprint decides every offset up front
@@ -332,7 +347,7 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
     push_entry(&mut buf, 256, 3, 1, args.width);
     push_entry(&mut buf, 257, 3, 1, args.height);
     push_entry(&mut buf, 258, 3, 1, 64);
-    push_entry(&mut buf, 259, 3, 1, 1);
+    push_entry(&mut buf, 259, 3, 1, if args.params.deflate { 8 } else { 1 });
     push_entry(&mut buf, 262, 3, 1, 1);
     push_entry(&mut buf, 277, 3, 1, 1);
     push_entry(&mut buf, 322, 3, 1, args.params.tile_width);
@@ -455,6 +470,11 @@ pub struct CogLevel {
     pub pixel_height: f64,
     tile_offsets: Vec<u64>,
     tile_byte_counts: Vec<u64>,
+    compression: u16,
+    predictor: u16,
+    bits: u32,
+    format: u32,
+    nodata: Option<f64>,
 }
 
 impl CogLevel {
@@ -546,19 +566,13 @@ impl<R: RangeRead> CogReader<R> {
         if col0 < l.width && row0 < l.height && cols > 0 && rows > 0 {
             let last_col = (col0 + cols - 1).min(l.width - 1);
             let last_row = (row0 + rows - 1).min(l.height - 1);
-            let expected = (l.tile_width * l.tile_height * 8) as u64;
             for tr in row0 / l.tile_height..=last_row / l.tile_height {
                 for tc in col0 / l.tile_width..=last_col / l.tile_width {
                     let idx = tr * l.tiles_across() + tc;
                     let (offset, len) = (l.tile_offsets[idx], l.tile_byte_counts[idx]);
-                    if len != expected {
-                        return Err(Error::Format(format!(
-                            "tile {idx} has {len} bytes, expected {expected}: \
-                             compressed cogs are not supported"
-                        )));
-                    }
                     let bytes = self.source.read_range(offset, len)?;
-                    copy_tile(&bytes, &l, tc, tr, col0, row0, cols, rows, &mut out);
+                    let values = decode_tile(&l, bytes)?;
+                    copy_tile(&values, &l, tc, tr, col0, row0, cols, rows, &mut out);
                 }
             }
         }
@@ -566,9 +580,129 @@ impl<R: RangeRead> CogReader<R> {
     }
 }
 
+/// raw tile bytes to f64 samples: decompress, undo the predictor, widen
+/// the sample type, and map the declared nodata to NaN
+fn decode_tile(l: &CogLevel, bytes: Vec<u8>) -> Result<Vec<f64>, Error> {
+    let sample = (l.bits / 8) as usize;
+    let expected = l.tile_width * l.tile_height * sample;
+    let mut raw = match l.compression {
+        1 => bytes,
+        8 => {
+            use std::io::Read;
+            let mut out = Vec::with_capacity(expected);
+            flate2::read::ZlibDecoder::new(bytes.as_slice()).read_to_end(&mut out)?;
+            out
+        }
+        other => return Err(Error::Format(format!("compression {other} unsupported"))),
+    };
+    if raw.len() != expected {
+        return Err(Error::Format(format!(
+            "tile decoded to {} bytes, expected {expected}",
+            raw.len()
+        )));
+    }
+    match l.predictor {
+        1 => {}
+        2 => undo_horizontal(&mut raw, l.tile_width, l.bits),
+        3 => raw = undo_fp(&raw, l.tile_width, sample),
+        other => return Err(Error::Format(format!("predictor {other} unsupported"))),
+    }
+    let mut vals = widen(&raw, l.bits, l.format);
+    if let Some(nd) = l.nodata {
+        for v in &mut vals {
+            if *v == nd || (nd.is_nan() && v.is_nan()) {
+                *v = f64::NAN;
+            }
+        }
+    }
+    Ok(vals)
+}
+
+/// undo per-row horizontal differencing of integer samples (predictor 2)
+fn undo_horizontal(raw: &mut [u8], width: usize, bits: u32) {
+    let sample = (bits / 8) as usize;
+    for row in raw.chunks_exact_mut(width * sample) {
+        match bits {
+            8 => {
+                for i in 1..width {
+                    row[i] = row[i].wrapping_add(row[i - 1]);
+                }
+            }
+            16 => {
+                for i in 1..width {
+                    let prev = u16::from_le_bytes(row[(i - 1) * 2..i * 2].try_into().unwrap());
+                    let cur = u16::from_le_bytes(row[i * 2..i * 2 + 2].try_into().unwrap());
+                    row[i * 2..i * 2 + 2].copy_from_slice(&prev.wrapping_add(cur).to_le_bytes());
+                }
+            }
+            _ => {
+                for i in 1..width {
+                    let prev = u32::from_le_bytes(row[(i - 1) * 4..i * 4].try_into().unwrap());
+                    let cur = u32::from_le_bytes(row[i * 4..i * 4 + 4].try_into().unwrap());
+                    row[i * 4..i * 4 + 4].copy_from_slice(&prev.wrapping_add(cur).to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// undo the floating-point predictor (3): per row, cumulative byte sum,
+/// then reassemble from byte planes stored most significant first
+fn undo_fp(raw: &[u8], width: usize, sample: usize) -> Vec<u8> {
+    let mut out = vec![0u8; raw.len()];
+    let stride = width * sample;
+    for (r, row) in raw.chunks_exact(stride).enumerate() {
+        let mut planes = row.to_vec();
+        for i in 1..stride {
+            planes[i] = planes[i].wrapping_add(planes[i - 1]);
+        }
+        for i in 0..width {
+            for k in 0..sample {
+                // byte k of the big-endian value sits in plane k
+                out[r * stride + i * sample + (sample - 1 - k)] = planes[k * width + i];
+            }
+        }
+    }
+    out
+}
+
+/// widen little-endian samples of the declared format to f64
+fn widen(raw: &[u8], bits: u32, format: u32) -> Vec<f64> {
+    let le2 = |c: &[u8]| [c[0], c[1]];
+    let le4 = |c: &[u8]| [c[0], c[1], c[2], c[3]];
+    match (format, bits) {
+        (1, 8) => raw.iter().map(|&b| f64::from(b)).collect(),
+        (2, 8) => raw.iter().map(|&b| f64::from(b as i8)).collect(),
+        (1, 16) => raw
+            .chunks_exact(2)
+            .map(|c| f64::from(u16::from_le_bytes(le2(c))))
+            .collect(),
+        (2, 16) => raw
+            .chunks_exact(2)
+            .map(|c| f64::from(i16::from_le_bytes(le2(c))))
+            .collect(),
+        (1, 32) => raw
+            .chunks_exact(4)
+            .map(|c| f64::from(u32::from_le_bytes(le4(c))))
+            .collect(),
+        (2, 32) => raw
+            .chunks_exact(4)
+            .map(|c| f64::from(i32::from_le_bytes(le4(c))))
+            .collect(),
+        (3, 32) => raw
+            .chunks_exact(4)
+            .map(|c| f64::from(f32::from_le_bytes(le4(c))))
+            .collect(),
+        _ => raw
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().expect("8-byte samples")))
+            .collect(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn copy_tile(
-    bytes: &[u8],
+    values: &[f64],
     l: &CogLevel,
     tc: usize,
     tr: usize,
@@ -590,9 +724,7 @@ fn copy_tile(
             if img_x < col0 || img_x > col0 + cols - 1 || img_x >= l.width {
                 continue;
             }
-            let src = (ty * l.tile_width + tx) * 8;
-            let v = f64::from_le_bytes(bytes[src..src + 8].try_into().unwrap());
-            out[(img_y - row0) * cols + (img_x - col0)] = v;
+            out[(img_y - row0) * cols + (img_x - col0)] = values[ty * l.tile_width + tx];
         }
     }
 }
@@ -607,9 +739,12 @@ fn parse_ifd<R: RangeRead>(
 
     let (mut width, mut height, mut tile_w, mut tile_h) = (0usize, 0usize, 0usize, 0usize);
     let (mut compression, mut bits, mut format, mut samples) = (1u32, 64u32, 3u32, 1u32);
+    let mut predictor = 1u32;
     let (mut offsets_at, mut counts_at, mut n_tiles) = (0u32, 0u32, 0usize);
     let (mut scale_at, mut tiepoint_at) = (0u32, 0u32);
     let (mut geokeys_at, mut geokeys_count) = (0u32, 0u32);
+    let (mut nodata_at, mut nodata_count) = (0u32, 0u32);
+    let mut nodata_inline = [0u8; 4];
 
     for i in 0..count {
         let e = i * 12;
@@ -622,6 +757,7 @@ fn parse_ifd<R: RangeRead>(
             258 => bits = value & 0xffff,
             259 => compression = value & 0xffff,
             277 => samples = value & 0xffff,
+            317 => predictor = value & 0xffff,
             322 => tile_w = value as usize,
             323 => tile_h = value as usize,
             324 => {
@@ -636,6 +772,12 @@ fn parse_ifd<R: RangeRead>(
                 geokeys_at = value;
                 geokeys_count = entry_count;
             }
+            // GDAL_NODATA, an ascii number
+            42113 => {
+                nodata_at = value;
+                nodata_count = entry_count;
+                nodata_inline.copy_from_slice(&block[e + 8..e + 12]);
+            }
             _ => {}
         }
     }
@@ -648,17 +790,52 @@ fn parse_ifd<R: RangeRead>(
             "not a tiled tiff, stripped files are read whole via read_geotiff".into(),
         ));
     }
-    if compression != 1 {
+    if compression != 1 && compression != 8 {
         return Err(Error::Format(format!(
-            "compression {compression} not supported, only uncompressed cogs"
+            "compression {compression} not supported, only uncompressed (1) and deflate (8)"
         )));
     }
-    if bits != 64 || format != 3 || samples != 1 {
+    if samples != 1 {
         return Err(Error::Format(format!(
-            "unsupported layout: {bits} bits format {format} samples {samples}, \
-             expected single-band 64-bit float"
+            "{samples} samples per pixel not supported, only single-band cogs"
         )));
     }
+    let known = matches!(
+        (format, bits),
+        (1, 8) | (1, 16) | (1, 32) | (2, 8) | (2, 16) | (2, 32) | (3, 32) | (3, 64)
+    );
+    if !known {
+        return Err(Error::Format(format!(
+            "unsupported sample layout: {bits} bits format {format}"
+        )));
+    }
+    let predictor_ok = match predictor {
+        1 => true,
+        2 => format != 3,
+        3 => format == 3,
+        _ => false,
+    };
+    if !predictor_ok {
+        return Err(Error::Format(format!(
+            "predictor {predictor} not supported for sample format {format}"
+        )));
+    }
+
+    let nodata = if nodata_count > 0 {
+        let bytes = if nodata_count <= 4 {
+            nodata_inline[..nodata_count as usize].to_vec()
+        } else {
+            source.read_range(u64::from(nodata_at), u64::from(nodata_count))?
+        };
+        let text: String = bytes
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as char)
+            .collect();
+        text.trim().parse::<f64>().ok()
+    } else {
+        None
+    };
 
     let read_u32s = |source: &mut R, at: u32, n: usize| -> Result<Vec<u64>, Error> {
         let bytes = source.read_range(u64::from(at), n as u64 * 4)?;
@@ -727,6 +904,11 @@ fn parse_ifd<R: RangeRead>(
             pixel_height,
             tile_offsets,
             tile_byte_counts,
+            compression: compression as u16,
+            predictor: predictor as u16,
+            bits,
+            format,
+            nodata,
         },
         meta,
         next,
@@ -840,6 +1022,7 @@ mod tests {
             origin_y: 90.0,
             pixel_width: 0.1,
             pixel_height: 0.1,
+            deflate: false,
         };
 
         let mut buf = io::Cursor::new(Vec::new());
@@ -866,6 +1049,7 @@ mod tests {
             origin_y: 5000000.0,
             pixel_width: 10.0,
             pixel_height: 10.0,
+            deflate: false,
         };
 
         let mut buf = io::Cursor::new(Vec::new());
@@ -898,6 +1082,7 @@ mod tests {
             origin_y: 50.0,
             pixel_width: 0.5,
             pixel_height: 0.5,
+            deflate: false,
         };
         let mut buf = io::Cursor::new(Vec::new());
         write_cog(&raster, &params, &mut buf).unwrap();
@@ -991,5 +1176,221 @@ mod tests {
         let reader = CogReader::open(bytes.as_slice()).unwrap();
         let widths: Vec<f64> = reader.levels().iter().map(|l| l.pixel_width).collect();
         assert_eq!(widths, vec![0.5, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn deflate_roundtrips_and_shrinks_the_file() {
+        let raster = test_raster(100, 80);
+        let mut params = CogParams {
+            tile_width: 16,
+            tile_height: 16,
+            overview_levels: 2,
+            ..CogParams::default()
+        };
+        let mut plain = io::Cursor::new(Vec::new());
+        write_cog(&raster, &params, &mut plain).unwrap();
+        params.deflate = true;
+        let mut packed = io::Cursor::new(Vec::new());
+        write_cog(&raster, &params, &mut packed).unwrap();
+        let (plain, packed) = (plain.into_inner(), packed.into_inner());
+        assert!(
+            packed.len() < plain.len(),
+            "deflate did not shrink the file"
+        );
+
+        let mut reader = CogReader::open(packed.as_slice()).unwrap();
+        let window = reader.read_window(0, 0, 0, 100, 80).unwrap();
+        for (a, b) in window.data().iter().zip(raster.data()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    /// minimal single-tile tiff with an arbitrary sample layout, for
+    /// exercising decode paths the writer does not produce
+    #[allow(clippy::too_many_arguments)]
+    fn build_test_tiff(
+        width: u32,
+        height: u32,
+        bits: u32,
+        format: u32,
+        compression: u16,
+        predictor: u16,
+        nodata: Option<&str>,
+        tile: &[u8],
+    ) -> Vec<u8> {
+        let nod: Option<Vec<u8>> = nodata.map(|s| {
+            let mut v = s.as_bytes().to_vec();
+            v.push(0);
+            v
+        });
+        let n: u32 = if nod.is_some() { 16 } else { 15 };
+        let aux = 8 + 2 + n * 12 + 4;
+        let (scale_off, tp_off, gk_off, nod_off) = (aux, aux + 24, aux + 72, aux + 88);
+        let nod_stored = nod.as_ref().filter(|v| v.len() > 4);
+        let tile_off = nod_off + nod_stored.map_or(0, |v| v.len() as u32);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        push_u16(&mut buf, 42);
+        push_u32(&mut buf, 8);
+        push_u16(&mut buf, n as u16);
+        push_entry(&mut buf, 256, 3, 1, width);
+        push_entry(&mut buf, 257, 3, 1, height);
+        push_entry(&mut buf, 258, 3, 1, bits);
+        push_entry(&mut buf, 259, 3, 1, u32::from(compression));
+        push_entry(&mut buf, 262, 3, 1, 1);
+        push_entry(&mut buf, 277, 3, 1, 1);
+        push_entry(&mut buf, 317, 3, 1, u32::from(predictor));
+        push_entry(&mut buf, 322, 3, 1, width);
+        push_entry(&mut buf, 323, 3, 1, height);
+        push_entry(&mut buf, 324, 4, 1, tile_off);
+        push_entry(&mut buf, 325, 4, 1, tile.len() as u32);
+        push_entry(&mut buf, 339, 3, 1, format);
+        push_entry(&mut buf, 33550, 12, 3, scale_off);
+        push_entry(&mut buf, 33922, 12, 6, tp_off);
+        push_entry(&mut buf, 34735, 3, 8, gk_off);
+        if let Some(v) = &nod {
+            let value = if v.len() <= 4 {
+                let mut b = [0u8; 4];
+                b[..v.len()].copy_from_slice(v);
+                u32::from_le_bytes(b)
+            } else {
+                nod_off
+            };
+            push_entry(&mut buf, 42113, 2, v.len() as u32, value);
+        }
+        push_u32(&mut buf, 0);
+
+        for v in [1.0f64, 1.0, 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.0f64, 0.0, 0.0, 5.0, 55.0, 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1, 0, 1, 2048, 0, 1, 4326] {
+            push_u16(&mut buf, v);
+        }
+        if let Some(v) = nod_stored {
+            buf.extend_from_slice(v);
+        }
+        buf.extend_from_slice(tile);
+        buf
+    }
+
+    fn zlib(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn read_all(bytes: &[u8], w: usize, h: usize) -> Vec<f64> {
+        let mut reader = CogReader::open(bytes).unwrap();
+        reader.read_window(0, 0, 0, w, h).unwrap().data().to_vec()
+    }
+
+    #[test]
+    fn uint16_and_int16_tiles_decode() {
+        let vals: Vec<u16> = (0..256u16).map(|i| i * 17 % 991).collect();
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tiff = build_test_tiff(16, 16, 16, 1, 1, 1, None, &raw);
+        let got = read_all(&tiff, 16, 16);
+        for (g, v) in got.iter().zip(&vals) {
+            assert_eq!(*g, f64::from(*v));
+        }
+
+        let vals: Vec<i16> = (0..256i32).map(|i| (i * 89 % 1000 - 500) as i16).collect();
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tiff = build_test_tiff(16, 16, 16, 2, 1, 1, None, &raw);
+        let got = read_all(&tiff, 16, 16);
+        for (g, v) in got.iter().zip(&vals) {
+            assert_eq!(*g, f64::from(*v));
+        }
+    }
+
+    #[test]
+    fn float32_tile_decodes() {
+        let vals: Vec<f32> = (0..256).map(|i| i as f32 * 1.25 - 100.5).collect();
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tiff = build_test_tiff(16, 16, 32, 3, 1, 1, None, &raw);
+        let got = read_all(&tiff, 16, 16);
+        for (g, v) in got.iter().zip(&vals) {
+            assert_eq!(*g, f64::from(*v));
+        }
+    }
+
+    #[test]
+    fn horizontal_predictor_deflate_uint16_decodes() {
+        let vals: Vec<u16> = (0..256u16).map(|i| 1000 + (i % 16) * 3 + i / 16).collect();
+        let mut diffed = Vec::with_capacity(256);
+        for row in vals.chunks(16) {
+            diffed.push(row[0]);
+            for i in 1..16 {
+                diffed.push(row[i].wrapping_sub(row[i - 1]));
+            }
+        }
+        let raw: Vec<u8> = diffed.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tiff = build_test_tiff(16, 16, 16, 1, 8, 2, None, &zlib(&raw));
+        let got = read_all(&tiff, 16, 16);
+        for (g, v) in got.iter().zip(&vals) {
+            assert_eq!(*g, f64::from(*v));
+        }
+    }
+
+    #[test]
+    fn floating_point_predictor_decodes() {
+        let vals: Vec<f32> = (0..256).map(|i| (i as f32).sin() * 500.0).collect();
+        let width = 16usize;
+        let mut encoded = Vec::new();
+        for row in vals.chunks(width) {
+            // byte planes, most significant first, then forward differencing
+            let mut planes = vec![0u8; width * 4];
+            for (i, v) in row.iter().enumerate() {
+                for (k, b) in v.to_be_bytes().iter().enumerate() {
+                    planes[k * width + i] = *b;
+                }
+            }
+            for i in (1..planes.len()).rev() {
+                planes[i] = planes[i].wrapping_sub(planes[i - 1]);
+            }
+            encoded.extend_from_slice(&planes);
+        }
+        let tiff = build_test_tiff(16, 16, 32, 3, 8, 3, None, &zlib(&encoded));
+        let got = read_all(&tiff, 16, 16);
+        for (g, v) in got.iter().zip(&vals) {
+            assert_eq!(*g, f64::from(*v));
+        }
+    }
+
+    #[test]
+    fn nodata_maps_to_nan_inline_and_stored() {
+        // short ascii fits in the value field
+        let vals: Vec<u16> = (0..256u16)
+            .map(|i| if i % 7 == 0 { 0 } else { i })
+            .collect();
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tiff = build_test_tiff(16, 16, 16, 1, 1, 1, Some("0"), &raw);
+        let got = read_all(&tiff, 16, 16);
+        for (g, v) in got.iter().zip(&vals) {
+            if *v == 0 {
+                assert!(g.is_nan(), "nodata value survived: {g}");
+            } else {
+                assert_eq!(*g, f64::from(*v));
+            }
+        }
+
+        // long ascii goes through the offset path
+        let vals: Vec<f32> = (0..256)
+            .map(|i| if i % 5 == 0 { -9999.25 } else { i as f32 })
+            .collect();
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tiff = build_test_tiff(16, 16, 32, 3, 1, 1, Some("-9999.25"), &raw);
+        let got = read_all(&tiff, 16, 16);
+        for (i, (g, v)) in got.iter().zip(&vals).enumerate() {
+            if i % 5 == 0 {
+                assert!(g.is_nan());
+            } else {
+                assert_eq!(*g, f64::from(*v));
+            }
+        }
     }
 }
