@@ -19,7 +19,10 @@ mod watershed;
 
 pub use algebra::{BinaryOp, UnaryOp, reclassify};
 pub use banded::BandedRaster;
-pub use cog::{CogParams, Overview, extract_tile, generate_overviews, write_cog};
+pub use cog::{
+    CogLevel, CogParams, CogReader, Overview, RangeRead, extract_tile, generate_overviews,
+    write_cog,
+};
 pub use contour::{ContourLine, ContourSegment, contours, fill_sinks};
 pub use error::Error;
 pub use geotiff::{
