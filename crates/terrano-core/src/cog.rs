@@ -536,6 +536,15 @@ fn write_u32<W: Write>(writer: &mut W, v: u32) -> Result<(), io::Error> {
 /// stream remote files, the reader never asks for more than it needs
 pub trait RangeRead {
     fn read_range(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, Error>;
+
+    /// several ranges in one call, results in request order. transports
+    /// that can multiplex override this, the default reads sequentially
+    fn read_ranges(&mut self, ranges: &[(u64, u64)]) -> Result<Vec<Vec<u8>>, Error> {
+        ranges
+            .iter()
+            .map(|&(offset, len)| self.read_range(offset, len))
+            .collect()
+    }
 }
 
 impl RangeRead for std::fs::File {
@@ -688,15 +697,22 @@ impl<R: RangeRead> CogReader<R> {
         if col0 < l.width && row0 < l.height && cols > 0 && rows > 0 {
             let last_col = (col0 + cols - 1).min(l.width - 1);
             let last_row = (row0 + rows - 1).min(l.height - 1);
+            let mut tiles = Vec::new();
+            let mut ranges = Vec::new();
             for tr in row0 / l.tile_height..=last_row / l.tile_height {
                 for tc in col0 / l.tile_width..=last_col / l.tile_width {
                     let idx = tr * l.tiles_across() + tc;
-                    let (offset, len) = (l.tile_offsets[idx], l.tile_byte_counts[idx]);
-                    let bytes = self.source.read_range(offset, len)?;
-                    let values = decode_tile(&l, bytes)?;
-                    for (band, plane) in out.iter_mut().enumerate() {
-                        copy_tile(&values, &l, band, tc, tr, col0, row0, cols, rows, plane);
-                    }
+                    tiles.push((tc, tr));
+                    ranges.push((l.tile_offsets[idx], l.tile_byte_counts[idx]));
+                }
+            }
+            // one call for every touched tile, so a multiplexing
+            // transport fetches them concurrently
+            let fetched = self.source.read_ranges(&ranges)?;
+            for ((tc, tr), bytes) in tiles.into_iter().zip(fetched) {
+                let values = decode_tile(&l, bytes)?;
+                for (band, plane) in out.iter_mut().enumerate() {
+                    copy_tile(&values, &l, band, tc, tr, col0, row0, cols, rows, plane);
                 }
             }
         }
