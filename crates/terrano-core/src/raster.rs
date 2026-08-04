@@ -81,4 +81,9 @@ impl Raster {
     pub fn data_mut(&mut self) -> &mut [f64] {
         &mut self.data
     }
+
+    /// Consume the raster, returning its row-major values.
+    pub fn into_data(self) -> Vec<f64> {
+        self.data
+    }
 }
