@@ -4,14 +4,20 @@
 //! the start of the file, and reads them back windowed: [`CogReader`] over
 //! a [`RangeRead`] source fetches only the tiles a window touches, so a
 //! `Range`-request http transport streams remote files without downloading
-//! them. The read side covers real-world single-band cogs: uncompressed or
-//! deflate tiles, horizontal and floating-point predictors, integer and
-//! float sample types (decoded to f64, nodata mapped to NaN). The writer
-//! produces 64-bit float tiles, raw or deflate.
+//! them. The read side covers real-world cogs: uncompressed or deflate
+//! tiles, horizontal and floating-point predictors, integer and float
+//! sample types (decoded to f64, nodata mapped to NaN). The writer produces
+//! 64-bit float tiles, raw or deflate.
+//!
+//! Multi-band files are pixel-interleaved (PlanarConfiguration 1) and go
+//! through [`write_cog_bands`] and [`CogReader::read_window_bands`]. The
+//! single-band [`write_cog`] and [`CogReader::read_window`] are the
+//! one-band case of the same pipeline.
 //!
 //! COG files follow the standard described at <https://www.cogeo.org/>.
 
 use crate::Error;
+use crate::banded::BandedRaster;
 use crate::geotiff::GeoTiffMetadata;
 use crate::raster::Raster;
 use std::io::{self, Seek, Write};
@@ -142,19 +148,51 @@ pub fn write_cog<W: Write + Seek>(
     params: &CogParams,
     writer: &mut W,
 ) -> Result<(), Error> {
-    let overviews = generate_overviews(raster, params.overview_levels);
+    write_bands(&[raster], params, writer)
+}
+
+/// Write a [`BandedRaster`] as a pixel-interleaved multi-band COG.
+///
+/// Same layout as [`write_cog`], with SamplesPerPixel set to the band count
+/// and PlanarConfiguration chunky. Overviews are block-averaged per band.
+pub fn write_cog_bands<W: Write + Seek>(
+    bands: &BandedRaster,
+    params: &CogParams,
+    writer: &mut W,
+) -> Result<(), Error> {
+    let refs: Vec<&Raster> = bands.bands().iter().collect();
+    write_bands(&refs, params, writer)
+}
+
+fn write_bands<W: Write + Seek>(
+    bands: &[&Raster],
+    params: &CogParams,
+    writer: &mut W,
+) -> Result<(), Error> {
+    let samples = bands.len();
+    let first = bands
+        .first()
+        .ok_or_else(|| Error::InvalidInput("a cog needs at least one band".into()))?;
+    let (width, height) = (first.width(), first.height());
+    let per_band: Vec<Vec<Overview>> = bands
+        .iter()
+        .map(|b| generate_overviews(b, params.overview_levels))
+        .collect();
+    let overviews = &per_band[0];
 
     let mut all_tile_data: Vec<Vec<Vec<u8>>> = Vec::new();
-    all_tile_data.push(raster_to_tiles(
-        raster.data(),
-        raster.width(),
-        raster.height(),
+    let planes: Vec<&[f64]> = bands.iter().map(|b| b.data()).collect();
+    all_tile_data.push(bands_to_tiles(
+        &planes,
+        width,
+        height,
         params.tile_width as usize,
         params.tile_height as usize,
     ));
-    for ov in &overviews {
-        all_tile_data.push(raster_to_tiles(
-            &ov.data,
+    for (i, ov) in overviews.iter().enumerate() {
+        let planes: Vec<&[f64]> = per_band.iter().map(|b| b[i].data.as_slice()).collect();
+        all_tile_data.push(bands_to_tiles(
+            &planes,
             ov.width,
             ov.height,
             params.tile_width as usize,
@@ -173,7 +211,10 @@ pub fn write_cog<W: Write + Seek>(
     }
 
     // per-ifd byte footprint decides every offset up front
-    let ifd_totals: Vec<usize> = all_tile_data.iter().map(|t| ifd_total(t.len())).collect();
+    let ifd_totals: Vec<usize> = all_tile_data
+        .iter()
+        .map(|t| ifd_total(t.len(), samples))
+        .collect();
     let mut ifd_starts = Vec::with_capacity(ifd_totals.len());
     let mut at = 8usize;
     for total in &ifd_totals {
@@ -202,10 +243,10 @@ pub fn write_cog<W: Write + Seek>(
     write_u32(writer, 8)?;
 
     for i in 0..all_tile_data.len() {
-        let (width, height, pixel_width, pixel_height) = if i == 0 {
+        let (level_width, level_height, pixel_width, pixel_height) = if i == 0 {
             (
-                raster.width() as u32,
-                raster.height() as u32,
+                width as u32,
+                height as u32,
                 params.pixel_width,
                 params.pixel_height,
             )
@@ -225,8 +266,9 @@ pub fn write_cog<W: Write + Seek>(
         };
         let ifd = build_ifd(&IfdArgs {
             base: ifd_starts[i] as u32,
-            width,
-            height,
+            width: level_width,
+            height: level_height,
+            samples,
             pixel_width,
             pixel_height,
             params,
@@ -280,8 +322,20 @@ pub fn extract_tile(
 }
 
 /// Split raster data into tiles, returning raw f64 bytes per tile.
+#[cfg(test)]
 fn raster_to_tiles(
     data: &[f64],
+    width: usize,
+    height: usize,
+    tile_w: usize,
+    tile_h: usize,
+) -> Vec<Vec<u8>> {
+    bands_to_tiles(&[data], width, height, tile_w, tile_h)
+}
+
+/// Split per-band planes into pixel-interleaved tiles of raw f64 bytes.
+fn bands_to_tiles(
+    planes: &[&[f64]],
     width: usize,
     height: usize,
     tile_w: usize,
@@ -293,17 +347,20 @@ fn raster_to_tiles(
 
     for tr in 0..tiles_down {
         for tc in 0..tiles_across {
-            let mut tile_data = Vec::with_capacity(tile_w * tile_h * 8);
+            let mut tile_data = Vec::with_capacity(tile_w * tile_h * planes.len() * 8);
             for ty in 0..tile_h {
                 let src_y = tr * tile_h + ty;
                 for tx in 0..tile_w {
                     let src_x = tc * tile_w + tx;
-                    let val = if src_x < width && src_y < height {
-                        data[src_y * width + src_x]
-                    } else {
-                        f64::NAN
-                    };
-                    tile_data.extend_from_slice(&val.to_le_bytes());
+                    let inside = src_x < width && src_y < height;
+                    for plane in planes {
+                        let val = if inside {
+                            plane[src_y * width + src_x]
+                        } else {
+                            f64::NAN
+                        };
+                        tile_data.extend_from_slice(&val.to_le_bytes());
+                    }
                 }
             }
             tiles.push(tile_data);
@@ -318,14 +375,29 @@ const IFD_BYTES: usize = 2 + IFD_ENTRIES * 12 + 4;
 // pixel scale (24) + tiepoint (48) + geokey directory (16)
 const GEO_BYTES: usize = 24 + 48 + 16;
 
-fn ifd_total(n_tiles: usize) -> usize {
-    IFD_BYTES + GEO_BYTES + if n_tiles > 1 { n_tiles * 8 } else { 0 }
+/// multi-band files add PlanarConfiguration
+fn ifd_bytes(samples: usize) -> usize {
+    IFD_BYTES + if samples > 1 { 12 } else { 0 }
+}
+
+/// BitsPerSample and SampleFormat carry one short per sample, and three or
+/// more no longer fit in the entry value field
+fn sample_array_bytes(samples: usize) -> usize {
+    if samples > 2 { samples * 4 } else { 0 }
+}
+
+fn ifd_total(n_tiles: usize, samples: usize) -> usize {
+    ifd_bytes(samples)
+        + GEO_BYTES
+        + sample_array_bytes(samples)
+        + if n_tiles > 1 { n_tiles * 8 } else { 0 }
 }
 
 struct IfdArgs<'a> {
     base: u32,
     width: u32,
     height: u32,
+    samples: usize,
     pixel_width: f64,
     pixel_height: f64,
     params: &'a CogParams,
@@ -336,20 +408,41 @@ struct IfdArgs<'a> {
 
 fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
     let n_tiles = args.tile_offsets.len();
-    let aux = args.base + IFD_BYTES as u32;
+    let samples = args.samples;
+    let aux = args.base + ifd_bytes(samples) as u32;
     let scale_off = aux;
     let tiepoint_off = aux + 24;
     let geokeys_off = aux + 72;
-    let arrays_off = aux + GEO_BYTES as u32;
+    let bits_off = aux + GEO_BYTES as u32;
+    let formats_off = bits_off + if samples > 2 { samples as u32 * 2 } else { 0 };
+    let arrays_off = aux + GEO_BYTES as u32 + sample_array_bytes(samples) as u32;
 
-    let mut buf = Vec::with_capacity(ifd_total(n_tiles));
-    push_u16(&mut buf, IFD_ENTRIES as u16);
+    // one short per sample: inline while two fit in the value field
+    let packed = |value: u32| -> u32 {
+        if samples == 1 {
+            value
+        } else {
+            value | (value << 16)
+        }
+    };
+    let entries = if samples > 1 {
+        IFD_ENTRIES + 1
+    } else {
+        IFD_ENTRIES
+    };
+
+    let mut buf = Vec::with_capacity(ifd_total(n_tiles, samples));
+    push_u16(&mut buf, entries as u16);
     push_entry(&mut buf, 256, 3, 1, args.width);
     push_entry(&mut buf, 257, 3, 1, args.height);
-    push_entry(&mut buf, 258, 3, 1, 64);
+    let bits_value = if samples > 2 { bits_off } else { packed(64) };
+    push_entry(&mut buf, 258, 3, samples as u32, bits_value);
     push_entry(&mut buf, 259, 3, 1, if args.params.deflate { 8 } else { 1 });
     push_entry(&mut buf, 262, 3, 1, 1);
-    push_entry(&mut buf, 277, 3, 1, 1);
+    push_entry(&mut buf, 277, 3, 1, samples as u32);
+    if samples > 1 {
+        push_entry(&mut buf, 284, 3, 1, 1);
+    }
     push_entry(&mut buf, 322, 3, 1, args.params.tile_width);
     push_entry(&mut buf, 323, 3, 1, args.params.tile_height);
     if n_tiles == 1 {
@@ -365,7 +458,8 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
             arrays_off + n_tiles as u32 * 4,
         );
     }
-    push_entry(&mut buf, 339, 3, 1, 3);
+    let format_value = if samples > 2 { formats_off } else { packed(3) };
+    push_entry(&mut buf, 339, 3, samples as u32, format_value);
     push_entry(&mut buf, 33550, 12, 3, scale_off);
     push_entry(&mut buf, 33922, 12, 6, tiepoint_off);
     push_entry(&mut buf, 34735, 3, 8, geokeys_off);
@@ -391,6 +485,15 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
     let key_id: u16 = if geographic { 2048 } else { 3072 };
     for v in [1u16, 1, 0, 1, key_id, 0, 1, args.params.epsg] {
         push_u16(&mut buf, v);
+    }
+
+    if samples > 2 {
+        for _ in 0..samples {
+            push_u16(&mut buf, 64);
+        }
+        for _ in 0..samples {
+            push_u16(&mut buf, 3);
+        }
     }
 
     if n_tiles > 1 {
@@ -468,6 +571,8 @@ pub struct CogLevel {
     pub tile_height: usize,
     pub pixel_width: f64,
     pub pixel_height: f64,
+    /// samples per pixel, one per band
+    pub samples: usize,
     tile_offsets: Vec<u64>,
     tile_byte_counts: Vec<u64>,
     compression: u16,
@@ -486,8 +591,8 @@ impl CogLevel {
 /// windowed cog reader over a [`RangeRead`] source.
 ///
 /// `open` learns the layout from small header reads, `read_window` fetches
-/// only the tiles a window touches. supports the subset [`write_cog`]
-/// produces: uncompressed, tiled, single-band 64-bit float
+/// only the tiles a window touches. multi-band files read through
+/// [`CogReader::read_window_bands`]
 pub struct CogReader<R: RangeRead> {
     source: R,
     levels: Vec<CogLevel>,
@@ -557,12 +662,29 @@ impl<R: RangeRead> CogReader<R> {
         cols: usize,
         rows: usize,
     ) -> Result<Raster, Error> {
-        let l = self
-            .levels
-            .get(level)
-            .ok_or_else(|| Error::Format(format!("no overview level {level}")))?
-            .clone();
-        let mut out = vec![f64::NAN; cols * rows];
+        let samples = self.level_at(level)?.samples;
+        if samples != 1 {
+            return Err(Error::Format(format!(
+                "{samples} samples per pixel, read multi-band cogs with read_window_bands"
+            )));
+        }
+        let bands = self.read_window_bands(level, col0, row0, cols, rows)?;
+        Ok(bands.into_bands().remove(0))
+    }
+
+    /// read a pixel window from one level as one [`Raster`] per band,
+    /// decoding each touched tile once. single-band files come back with
+    /// one band. pixels outside the image come back NaN
+    pub fn read_window_bands(
+        &mut self,
+        level: usize,
+        col0: usize,
+        row0: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Result<BandedRaster, Error> {
+        let l = self.level_at(level)?.clone();
+        let mut out = vec![vec![f64::NAN; cols * rows]; l.samples];
         if col0 < l.width && row0 < l.height && cols > 0 && rows > 0 {
             let last_col = (col0 + cols - 1).min(l.width - 1);
             let last_row = (row0 + rows - 1).min(l.height - 1);
@@ -572,19 +694,32 @@ impl<R: RangeRead> CogReader<R> {
                     let (offset, len) = (l.tile_offsets[idx], l.tile_byte_counts[idx]);
                     let bytes = self.source.read_range(offset, len)?;
                     let values = decode_tile(&l, bytes)?;
-                    copy_tile(&values, &l, tc, tr, col0, row0, cols, rows, &mut out);
+                    for (band, plane) in out.iter_mut().enumerate() {
+                        copy_tile(&values, &l, band, tc, tr, col0, row0, cols, rows, plane);
+                    }
                 }
             }
         }
-        Raster::from_vec(cols, rows, out, l.pixel_width, f64::NAN)
+        let bands = out
+            .into_iter()
+            .map(|plane| Raster::from_vec(cols, rows, plane, l.pixel_width, f64::NAN))
+            .collect::<Result<Vec<_>, _>>()?;
+        BandedRaster::new(bands)
+    }
+
+    fn level_at(&self, level: usize) -> Result<&CogLevel, Error> {
+        self.levels
+            .get(level)
+            .ok_or_else(|| Error::Format(format!("no overview level {level}")))
     }
 }
 
 /// raw tile bytes to f64 samples: decompress, undo the predictor, widen
-/// the sample type, and map the declared nodata to NaN
+/// the sample type, and map the declared nodata to NaN. multi-band samples
+/// stay pixel-interleaved
 fn decode_tile(l: &CogLevel, bytes: Vec<u8>) -> Result<Vec<f64>, Error> {
     let sample = (l.bits / 8) as usize;
-    let expected = l.tile_width * l.tile_height * sample;
+    let expected = l.tile_width * l.tile_height * l.samples * sample;
     let mut raw = match l.compression {
         1 => bytes,
         8 => {
@@ -603,8 +738,8 @@ fn decode_tile(l: &CogLevel, bytes: Vec<u8>) -> Result<Vec<f64>, Error> {
     }
     match l.predictor {
         1 => {}
-        2 => undo_horizontal(&mut raw, l.tile_width, l.bits),
-        3 => raw = undo_fp(&raw, l.tile_width, sample),
+        2 => undo_horizontal(&mut raw, l.tile_width * l.samples, l.samples, l.bits),
+        3 => raw = undo_fp(&raw, l.tile_width * l.samples, sample),
         other => return Err(Error::Format(format!("predictor {other} unsupported"))),
     }
     let mut vals = widen(&raw, l.bits, l.format);
@@ -618,26 +753,30 @@ fn decode_tile(l: &CogLevel, bytes: Vec<u8>) -> Result<Vec<f64>, Error> {
     Ok(vals)
 }
 
-/// undo per-row horizontal differencing of integer samples (predictor 2)
-fn undo_horizontal(raw: &mut [u8], width: usize, bits: u32) {
+/// undo per-row horizontal differencing of integer samples (predictor 2).
+/// `count` is samples per row across all bands, each difference taken
+/// against the same band of the previous pixel
+fn undo_horizontal(raw: &mut [u8], count: usize, spp: usize, bits: u32) {
     let sample = (bits / 8) as usize;
-    for row in raw.chunks_exact_mut(width * sample) {
+    for row in raw.chunks_exact_mut(count * sample) {
         match bits {
             8 => {
-                for i in 1..width {
-                    row[i] = row[i].wrapping_add(row[i - 1]);
+                for i in spp..count {
+                    row[i] = row[i].wrapping_add(row[i - spp]);
                 }
             }
             16 => {
-                for i in 1..width {
-                    let prev = u16::from_le_bytes(row[(i - 1) * 2..i * 2].try_into().unwrap());
+                for i in spp..count {
+                    let p = (i - spp) * 2;
+                    let prev = u16::from_le_bytes(row[p..p + 2].try_into().unwrap());
                     let cur = u16::from_le_bytes(row[i * 2..i * 2 + 2].try_into().unwrap());
                     row[i * 2..i * 2 + 2].copy_from_slice(&prev.wrapping_add(cur).to_le_bytes());
                 }
             }
             _ => {
-                for i in 1..width {
-                    let prev = u32::from_le_bytes(row[(i - 1) * 4..i * 4].try_into().unwrap());
+                for i in spp..count {
+                    let p = (i - spp) * 4;
+                    let prev = u32::from_le_bytes(row[p..p + 4].try_into().unwrap());
                     let cur = u32::from_le_bytes(row[i * 4..i * 4 + 4].try_into().unwrap());
                     row[i * 4..i * 4 + 4].copy_from_slice(&prev.wrapping_add(cur).to_le_bytes());
                 }
@@ -648,18 +787,18 @@ fn undo_horizontal(raw: &mut [u8], width: usize, bits: u32) {
 
 /// undo the floating-point predictor (3): per row, cumulative byte sum,
 /// then reassemble from byte planes stored most significant first
-fn undo_fp(raw: &[u8], width: usize, sample: usize) -> Vec<u8> {
+fn undo_fp(raw: &[u8], count: usize, sample: usize) -> Vec<u8> {
     let mut out = vec![0u8; raw.len()];
-    let stride = width * sample;
+    let stride = count * sample;
     for (r, row) in raw.chunks_exact(stride).enumerate() {
         let mut planes = row.to_vec();
         for i in 1..stride {
             planes[i] = planes[i].wrapping_add(planes[i - 1]);
         }
-        for i in 0..width {
+        for i in 0..count {
             for k in 0..sample {
                 // byte k of the big-endian value sits in plane k
-                out[r * stride + i * sample + (sample - 1 - k)] = planes[k * width + i];
+                out[r * stride + i * sample + (sample - 1 - k)] = planes[k * count + i];
             }
         }
     }
@@ -700,10 +839,12 @@ fn widen(raw: &[u8], bits: u32, format: u32) -> Vec<f64> {
     }
 }
 
+/// copy one band of a decoded tile into the window buffer
 #[allow(clippy::too_many_arguments)]
 fn copy_tile(
     values: &[f64],
     l: &CogLevel,
+    band: usize,
     tc: usize,
     tr: usize,
     col0: usize,
@@ -724,8 +865,42 @@ fn copy_tile(
             if img_x < col0 || img_x > col0 + cols - 1 || img_x >= l.width {
                 continue;
             }
-            out[(img_y - row0) * cols + (img_x - col0)] = values[ty * l.tile_width + tx];
+            out[(img_y - row0) * cols + (img_x - col0)] =
+                values[(ty * l.tile_width + tx) * l.samples + band];
         }
+    }
+}
+
+/// a SHORT-valued ifd entry that may hold one value per sample: up to two
+/// sit in the entry itself, more live at an offset
+#[derive(Default)]
+struct ShortList {
+    count: u32,
+    inline: [u8; 4],
+}
+
+impl ShortList {
+    fn at(block: &[u8], entry: usize, count: u32) -> Self {
+        let mut inline = [0u8; 4];
+        inline.copy_from_slice(&block[entry + 8..entry + 12]);
+        Self { count, inline }
+    }
+
+    fn resolve<R: RangeRead>(&self, source: &mut R) -> Result<Vec<u16>, Error> {
+        if self.count == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = if self.count <= 2 {
+            self.inline.to_vec()
+        } else {
+            let at = u32::from_le_bytes(self.inline);
+            source.read_range(u64::from(at), u64::from(self.count) * 2)?
+        };
+        Ok(bytes
+            .chunks_exact(2)
+            .take(self.count as usize)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect())
     }
 }
 
@@ -739,7 +914,9 @@ fn parse_ifd<R: RangeRead>(
 
     let (mut width, mut height, mut tile_w, mut tile_h) = (0usize, 0usize, 0usize, 0usize);
     let (mut compression, mut bits, mut format, mut samples) = (1u32, 64u32, 3u32, 1u32);
-    let mut predictor = 1u32;
+    let (mut predictor, mut planar) = (1u32, 1u32);
+    let mut bits_entry = ShortList::default();
+    let mut format_entry = ShortList::default();
     let (mut offsets_at, mut counts_at, mut n_tiles) = (0u32, 0u32, 0usize);
     let (mut scale_at, mut tiepoint_at) = (0u32, 0u32);
     let (mut geokeys_at, mut geokeys_count) = (0u32, 0u32);
@@ -754,9 +931,10 @@ fn parse_ifd<R: RangeRead>(
         match tag {
             256 => width = value as usize,
             257 => height = value as usize,
-            258 => bits = value & 0xffff,
+            258 => bits_entry = ShortList::at(block, e, entry_count),
             259 => compression = value & 0xffff,
             277 => samples = value & 0xffff,
+            284 => planar = value & 0xffff,
             317 => predictor = value & 0xffff,
             322 => tile_w = value as usize,
             323 => tile_h = value as usize,
@@ -765,7 +943,7 @@ fn parse_ifd<R: RangeRead>(
                 n_tiles = entry_count as usize;
             }
             325 => counts_at = value,
-            339 => format = value & 0xffff,
+            339 => format_entry = ShortList::at(block, e, entry_count),
             33550 => scale_at = value,
             33922 => tiepoint_at = value,
             34735 => {
@@ -782,6 +960,26 @@ fn parse_ifd<R: RangeRead>(
         }
     }
 
+    let bits_list = bits_entry.resolve(source)?;
+    let format_list = format_entry.resolve(source)?;
+    if let Some(&first) = bits_list.first() {
+        if bits_list.iter().any(|&b| b != first) {
+            return Err(Error::Format(
+                "BitsPerSample differs across samples, every band must share one bit depth".into(),
+            ));
+        }
+        bits = u32::from(first);
+    }
+    if let Some(&first) = format_list.first() {
+        if format_list.iter().any(|&f| f != first) {
+            return Err(Error::Format(
+                "SampleFormat differs across samples, every band must share one sample format"
+                    .into(),
+            ));
+        }
+        format = u32::from(first);
+    }
+
     if width == 0 || height == 0 {
         return Err(Error::Format("ifd missing width/height".into()));
     }
@@ -795,10 +993,13 @@ fn parse_ifd<R: RangeRead>(
             "compression {compression} not supported, only uncompressed (1) and deflate (8)"
         )));
     }
-    if samples != 1 {
-        return Err(Error::Format(format!(
-            "{samples} samples per pixel not supported, only single-band cogs"
-        )));
+    if samples == 0 {
+        return Err(Error::Format("SamplesPerPixel is 0".into()));
+    }
+    if samples > 1 && planar != 1 {
+        return Err(Error::Format(
+            "only pixel-interleaved (PlanarConfiguration 1) cogs supported".into(),
+        ));
     }
     let known = matches!(
         (format, bits),
@@ -902,6 +1103,7 @@ fn parse_ifd<R: RangeRead>(
             tile_height: tile_h,
             pixel_width,
             pixel_height,
+            samples: samples as usize,
             tile_offsets,
             tile_byte_counts,
             compression: compression as u16,
@@ -1392,5 +1594,248 @@ mod tests {
                 assert_eq!(*g, f64::from(*v));
             }
         }
+    }
+
+    fn test_bands(width: usize, height: usize, count: usize) -> BandedRaster {
+        let bands = (0..count)
+            .map(|b| {
+                let data = (0..width * height)
+                    .map(|i| i as f64 * 0.25 + b as f64 * 1000.0)
+                    .collect();
+                Raster::from_vec(width, height, data, 1.0, -9999.0).unwrap()
+            })
+            .collect();
+        BandedRaster::new(bands).unwrap()
+    }
+
+    fn banded_params(deflate: bool) -> CogParams {
+        CogParams {
+            tile_width: 16,
+            tile_height: 16,
+            overview_levels: 1,
+            epsg: 4326,
+            origin_x: 10.0,
+            origin_y: 50.0,
+            pixel_width: 0.5,
+            pixel_height: 0.5,
+            deflate,
+        }
+    }
+
+    fn write_test_cog_bands(bands: &BandedRaster, deflate: bool) -> Vec<u8> {
+        let mut buf = io::Cursor::new(Vec::new());
+        write_cog_bands(bands, &banded_params(deflate), &mut buf).unwrap();
+        buf.into_inner()
+    }
+
+    fn assert_close(got: &[f64], want: &[f64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!((g - w).abs() < 1e-12, "{what}: {g} vs {w} at {i}");
+        }
+    }
+
+    #[test]
+    fn banded_roundtrips_at_base_and_overview() {
+        for count in [2, 3, 4] {
+            for deflate in [false, true] {
+                let bands = test_bands(40, 30, count);
+                let bytes = write_test_cog_bands(&bands, deflate);
+                let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+                assert_eq!(reader.levels().len(), 2);
+                assert_eq!(reader.levels()[0].samples, count);
+
+                let base = reader.read_window_bands(0, 0, 0, 40, 30).unwrap();
+                assert_eq!(base.band_count(), count);
+                for b in 0..count {
+                    assert_close(
+                        base.band(b).unwrap().data(),
+                        bands.band(b).unwrap().data(),
+                        &format!("band {b} of {count}, deflate {deflate}"),
+                    );
+                }
+
+                let ov = reader.read_window_bands(1, 0, 0, 20, 15).unwrap();
+                for b in 0..count {
+                    let expected = generate_overviews(bands.band(b).unwrap(), 1);
+                    assert_close(
+                        ov.band(b).unwrap().data(),
+                        &expected[0].data,
+                        &format!("overview band {b} of {count}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn banded_window_offset_from_the_origin() {
+        let bands = test_bands(40, 30, 3);
+        let bytes = write_test_cog_bands(&bands, true);
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let window = reader.read_window_bands(0, 7, 5, 20, 18).unwrap();
+        for b in 0..3 {
+            let src = bands.band(b).unwrap().data();
+            let got = window.band(b).unwrap().data();
+            for row in 0..18 {
+                for col in 0..20 {
+                    let want = src[(row + 5) * 40 + (col + 7)];
+                    assert!((got[row * 20 + col] - want).abs() < 1e-12);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_window_on_a_multi_band_cog_points_at_read_window_bands() {
+        let bytes = write_test_cog_bands(&test_bands(20, 20, 3), false);
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let err = reader.read_window(0, 0, 0, 4, 4).unwrap_err().to_string();
+        assert!(err.contains("read_window_bands"), "unhelpful error: {err}");
+        assert!(err.contains('3'), "error omits the sample count: {err}");
+    }
+
+    #[test]
+    fn single_band_agrees_through_both_paths() {
+        let (raster, bytes) = write_test_cog(64, 48, 1, 4326);
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let plain = reader.read_window(0, 3, 4, 20, 20).unwrap();
+        let banded = reader.read_window_bands(0, 3, 4, 20, 20).unwrap();
+        assert_eq!(banded.band_count(), 1);
+        assert_eq!(plain.data(), banded.band(0).unwrap().data());
+        for row in 0..20 {
+            for col in 0..20 {
+                let want = raster.data()[(row + 4) * 64 + (col + 3)];
+                assert!((plain.data()[row * 20 + col] - want).abs() < 1e-12);
+            }
+        }
+
+        // one band through write_cog_bands matches write_cog
+        let one = BandedRaster::new(vec![raster.clone()]).unwrap();
+        let mut via_bands = io::Cursor::new(Vec::new());
+        write_cog_bands(&one, &banded_params(false), &mut via_bands).unwrap();
+        let mut via_plain = io::Cursor::new(Vec::new());
+        write_cog(&raster, &banded_params(false), &mut via_plain).unwrap();
+        assert_eq!(via_bands.into_inner(), via_plain.into_inner());
+    }
+
+    /// single-tile multi-band tiff with explicit per-sample bits and
+    /// formats, for layouts the writer does not produce
+    fn build_banded_tiff(
+        width: u32,
+        height: u32,
+        bits: &[u16],
+        formats: &[u16],
+        planar: u16,
+        tile: &[u8],
+    ) -> Vec<u8> {
+        let samples = bits.len() as u32;
+        let n: u32 = 15;
+        let aux = 8 + 2 + n * 12 + 4;
+        let (scale_off, tp_off, gk_off) = (aux, aux + 24, aux + 72);
+        let arrays_off = aux + 88;
+        let tile_off = arrays_off + if samples > 2 { samples * 4 } else { 0 };
+        let pack = |v: &[u16]| -> u32 {
+            let hi = v.get(1).copied().unwrap_or(0);
+            u32::from(v[0]) | (u32::from(hi) << 16)
+        };
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        push_u16(&mut buf, 42);
+        push_u32(&mut buf, 8);
+        push_u16(&mut buf, n as u16);
+        push_entry(&mut buf, 256, 3, 1, width);
+        push_entry(&mut buf, 257, 3, 1, height);
+        let bits_value = if samples > 2 { arrays_off } else { pack(bits) };
+        push_entry(&mut buf, 258, 3, samples, bits_value);
+        push_entry(&mut buf, 259, 3, 1, 1);
+        push_entry(&mut buf, 262, 3, 1, 1);
+        push_entry(&mut buf, 277, 3, 1, samples);
+        push_entry(&mut buf, 284, 3, 1, u32::from(planar));
+        push_entry(&mut buf, 322, 3, 1, width);
+        push_entry(&mut buf, 323, 3, 1, height);
+        push_entry(&mut buf, 324, 4, 1, tile_off);
+        push_entry(&mut buf, 325, 4, 1, tile.len() as u32);
+        let formats_value = if samples > 2 {
+            arrays_off + samples * 2
+        } else {
+            pack(formats)
+        };
+        push_entry(&mut buf, 339, 3, samples, formats_value);
+        push_entry(&mut buf, 33550, 12, 3, scale_off);
+        push_entry(&mut buf, 33922, 12, 6, tp_off);
+        push_entry(&mut buf, 34735, 3, 8, gk_off);
+        push_u32(&mut buf, 0);
+
+        for v in [1.0f64, 1.0, 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.0f64, 0.0, 0.0, 5.0, 55.0, 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1, 0, 1, 2048, 0, 1, 4326] {
+            push_u16(&mut buf, v);
+        }
+        if samples > 2 {
+            for v in bits.iter().chain(formats) {
+                push_u16(&mut buf, *v);
+            }
+        }
+        buf.extend_from_slice(tile);
+        buf
+    }
+
+    #[test]
+    fn foreign_multi_band_tile_deinterleaves() {
+        // three uint16 bands, pixel-interleaved, not written by write_cog
+        let pixels = 16 * 16;
+        let bands: Vec<Vec<u16>> = (0..3)
+            .map(|b| (0..pixels).map(|i| (i * 7 + b * 3000) as u16).collect())
+            .collect();
+        let mut raw = Vec::new();
+        for p in 0..pixels {
+            for band in &bands {
+                raw.extend_from_slice(&band[p].to_le_bytes());
+            }
+        }
+        let tiff = build_banded_tiff(16, 16, &[16; 3], &[1; 3], 1, &raw);
+        let mut reader = CogReader::open(tiff.as_slice()).unwrap();
+        let got = reader.read_window_bands(0, 0, 0, 16, 16).unwrap();
+        assert_eq!(got.band_count(), 3);
+        for (b, band) in bands.iter().enumerate() {
+            let want: Vec<f64> = band.iter().map(|&v| f64::from(v)).collect();
+            assert_close(got.band(b).unwrap().data(), &want, &format!("band {b}"));
+        }
+    }
+
+    fn open_err(bytes: &[u8]) -> String {
+        match CogReader::open(bytes) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected open to reject this file"),
+        }
+    }
+
+    #[test]
+    fn mismatched_sample_layouts_error_at_open() {
+        let raw = vec![0u8; 16 * 16 * 2 * 8];
+        // two samples, one 64-bit and one 32-bit, packed in the value field
+        let tiff = build_banded_tiff(16, 16, &[64, 32], &[3, 3], 1, &raw);
+        let err = open_err(&tiff);
+        assert!(err.contains("BitsPerSample"), "{err}");
+
+        // three samples, formats read from the offset array
+        let raw = vec![0u8; 16 * 16 * 3 * 8];
+        let tiff = build_banded_tiff(16, 16, &[64; 3], &[3, 3, 1], 1, &raw);
+        let err = open_err(&tiff);
+        assert!(err.contains("SampleFormat"), "{err}");
+    }
+
+    #[test]
+    fn band_interleaved_planar_config_is_rejected() {
+        let raw = vec![0u8; 16 * 16 * 2 * 8];
+        let tiff = build_banded_tiff(16, 16, &[64; 2], &[3; 2], 2, &raw);
+        let err = open_err(&tiff);
+        assert!(err.contains("PlanarConfiguration"), "{err}");
     }
 }

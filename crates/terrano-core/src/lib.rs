@@ -21,7 +21,7 @@ pub use algebra::{BinaryOp, UnaryOp, reclassify};
 pub use banded::BandedRaster;
 pub use cog::{
     CogLevel, CogParams, CogReader, Overview, RangeRead, extract_tile, generate_overviews,
-    write_cog,
+    write_cog, write_cog_bands,
 };
 pub use contour::{ContourLine, ContourSegment, contours, fill_sinks};
 pub use error::Error;
