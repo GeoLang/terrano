@@ -1,14 +1,44 @@
 //! wasm surface over terrano-core: free functions over flat f64 buffers, so a
 //! browser hands typed arrays across the boundary without a Raster type on the
 //! JS side. Every function takes (data, width, height, cell_size, nodata) plus
-//! its own parameters and returns a new buffer of the same shape. Contours
+//! its own parameters and returns a new buffer of the same shape, except
+//! `focalStats`, whose window is measured in cells. Contours
 //! come back flat-encoded, [level, vertex_count, x0, y0, x1, y1, ...] per
 //! line, because nested structs would otherwise be serialized per vertex.
 //! Polygons nest one level deeper: [value, ring_count, (vertex_count, x0, y0,
 //! ...) per ring], exterior ring first.
 
-use terrano_core::{BinaryOp, Raster, UnaryOp};
+use terrano_core::{BinaryOp, FocalStat, Neighborhood, Raster, RegionPolygon, UnaryOp};
 use wasm_bindgen::prelude::*;
+
+/// Read the polygon encoding this module also emits from `polygonize`.
+fn decode_polygons(flat: &[f64]) -> Result<Vec<RegionPolygon>, JsError> {
+    let mut polygons = Vec::new();
+    let mut i = 0;
+    while i + 1 < flat.len() {
+        let value = flat[i];
+        let ring_count = flat[i + 1] as usize;
+        i += 2;
+        let mut rings = Vec::with_capacity(ring_count);
+        for _ in 0..ring_count {
+            let n = *flat
+                .get(i)
+                .ok_or_else(|| JsError::new("polygon buffer ends mid-ring"))?
+                as usize;
+            if i + 1 + n * 2 > flat.len() {
+                return Err(JsError::new("polygon buffer ends mid-ring"));
+            }
+            rings.push(
+                (0..n)
+                    .map(|v| (flat[i + 1 + v * 2], flat[i + 2 + v * 2]))
+                    .collect(),
+            );
+            i += 1 + n * 2;
+        }
+        polygons.push(RegionPolygon { value, rings });
+    }
+    Ok(polygons)
+}
 
 fn raster(
     data: &[f64],
@@ -219,6 +249,93 @@ pub fn polygonize(
     Ok(flat)
 }
 
+/// Windows are measured in cells, so this one takes no cell size.
+#[wasm_bindgen(js_name = focalStats)]
+pub fn focal_stats(
+    data: &[f64],
+    width: usize,
+    height: usize,
+    nodata: f64,
+    radius: usize,
+    shape: &str,
+    stat: &str,
+) -> Result<Vec<f64>, JsError> {
+    let shape = match shape {
+        "square" => Neighborhood::Square,
+        "circle" => Neighborhood::Circle,
+        _ => return Err(JsError::new(&format!("unknown neighbourhood {shape:?}"))),
+    };
+    let stat = match stat {
+        "min" => FocalStat::Min,
+        "max" => FocalStat::Max,
+        "mean" => FocalStat::Mean,
+        "sum" => FocalStat::Sum,
+        "std" => FocalStat::Std,
+        "median" => FocalStat::Median,
+        "majority" => FocalStat::Majority,
+        "range" => FocalStat::Range,
+        _ => return Err(JsError::new(&format!("unknown focal statistic {stat:?}"))),
+    };
+    let src = raster(data, width, height, 1.0, nodata)?;
+    Ok(terrano_core::focal_stats(&src, radius, shape, stat).into_data())
+}
+
+/// Rows come back flat as [zone, count, min, max, mean, sum, std, median].
+#[wasm_bindgen(js_name = zonalStats)]
+pub fn zonal_stats(
+    values: &[f64],
+    zones: &[f64],
+    width: usize,
+    height: usize,
+    cell_size: f64,
+    nodata: f64,
+) -> Result<Vec<f64>, JsError> {
+    let values = raster(values, width, height, cell_size, nodata)?;
+    let zones = raster(zones, width, height, cell_size, nodata)?;
+    let rows =
+        terrano_core::zonal_stats(&values, &zones).map_err(|e| JsError::new(&e.to_string()))?;
+    let mut flat = Vec::with_capacity(rows.len() * 8);
+    for z in rows {
+        flat.extend_from_slice(&[
+            z.zone,
+            z.count as f64,
+            z.min,
+            z.max,
+            z.mean,
+            z.sum,
+            z.std,
+            z.median,
+        ]);
+    }
+    Ok(flat)
+}
+
+/// `polygons` uses the same encoding `polygonize` returns, in the north-up
+/// coordinates of `bbox` (xmin, ymin, xmax, ymax).
+#[wasm_bindgen]
+pub fn rasterize(
+    polygons: &[f64],
+    width: usize,
+    height: usize,
+    bbox: &[f64],
+    cell_size: f64,
+    nodata: f64,
+) -> Result<Vec<f64>, JsError> {
+    if bbox.len() != 4 {
+        return Err(JsError::new("bbox must be [xmin, ymin, xmax, ymax]"));
+    }
+    let polygons = decode_polygons(polygons)?;
+    Ok(terrano_core::rasterize(
+        &polygons,
+        width,
+        height,
+        (bbox[0], bbox[1], bbox[2], bbox[3]),
+        cell_size,
+        nodata,
+    )
+    .into_data())
+}
+
 // happy paths only: constructing a JsError aborts off wasm, so the error arms
 // are exercised by the browser tests in the consuming viewer instead
 #[cfg(test)]
@@ -328,6 +445,52 @@ mod tests {
         assert_eq!(i, flat.len(), "flat encoding parses exactly");
         assert!(shapes.contains(&(5.0, 1)), "{shapes:?}");
         assert!(shapes.contains(&(1.0, 2)), "{shapes:?}");
+    }
+
+    #[test]
+    fn focal_and_zonal_parse_their_names_and_shapes() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let mean = focal_stats(&data, 3, 3, NODATA, 1, "square", "mean").unwrap();
+        assert_eq!(mean[4], 5.0);
+        let zones = vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
+        let flat = zonal_stats(&data, &zones, 3, 3, 1.0, NODATA).unwrap();
+        assert_eq!(flat.len(), 16, "two zones of eight fields");
+        assert_eq!(flat[0], 1.0, "first row is zone 1");
+        assert_eq!(flat[1], 3.0, "three cells in it");
+        assert_eq!(flat[4], 2.0, "mean of 1, 2, 3");
+    }
+
+    #[test]
+    fn rasterize_reads_the_polygon_encoding_polygonize_writes() {
+        // a 2x2 block of 5s in a 4x4 field of 1s, polygonized then burnt back
+        let mut data = vec![1.0; 16];
+        for i in [5, 6, 9, 10] {
+            data[i] = 5.0;
+        }
+        let flat = polygonize(&data, 4, 4, 1.0, NODATA).unwrap();
+        // polygonize counts rows downward, rasterize reads north-up
+        let flipped = flip_polygon_y(&flat, 4.0);
+
+        let back = rasterize(&flipped, 4, 4, &[0.0, 0.0, 4.0, 4.0], 1.0, NODATA).unwrap();
+        assert_eq!(back, data);
+    }
+
+    /// Walk the polygon encoding, negating each vertex y about `height`.
+    fn flip_polygon_y(flat: &[f64], height: f64) -> Vec<f64> {
+        let mut out = flat.to_vec();
+        let mut i = 0;
+        while i + 1 < out.len() {
+            let rings = out[i + 1] as usize;
+            i += 2;
+            for _ in 0..rings {
+                let n = out[i] as usize;
+                for v in 0..n {
+                    out[i + 2 + v * 2] = height - out[i + 2 + v * 2];
+                }
+                i += 1 + n * 2;
+            }
+        }
+        out
     }
 
     #[test]

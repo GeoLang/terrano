@@ -19,6 +19,9 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 - **Map algebra** — Unary (add, multiply, sqrt, abs, log) and binary (add, subtract, multiply, divide, min, max) operations
 - **Reclassification** — Value-range-based class assignment
 - **Polygonize** — Connected runs of equal cells traced as polygon rings with holes, for a classified raster
+- **Rasterize** — Polygons burnt onto a grid by cell centre, holes cut out, the inverse of polygonize
+- **Focal statistics** — Moving-window min/max/mean/sum/std/median/majority/range over a square or circular neighbourhood
+- **Zonal statistics** — Per-zone summary of one raster grouped by the labels of another
 - **GeoTIFF I/O** — Read and write GeoTIFF rasters with CRS metadata
 - **Multi-band rasters** — `BandedRaster` holds RGB/RGBA or any band set on one grid, written and read as a multi-band GeoTIFF with 8-bit or 64-bit float samples
 - **Cloud Optimized GeoTIFF (COG)** — tiled writing with overview pyramids (raw or deflate), and windowed reads over a byte-range seam (`CogReader` fetches only the tiles a window touches, wire it to `Range` requests for remote streaming). Reads real-world single-band COGs: deflate, horizontal and floating-point predictors, integer and float sample types, GDAL nodata mapped to NaN. Multi-band COGs are pixel-interleaved through `write_cog_bands` and `CogReader::read_window_bands`

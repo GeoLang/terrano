@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `focal_stats`, `zonal_stats` and `rasterize` (2026-08-04): the neighbourhood
+  and grouped summaries, plus the polygon burn that feeds them.
+  `focal_stats(raster, radius, shape, stat)` reports min/max/mean/sum/std/
+  median/majority/range over a square or circular window, clipping at the
+  raster edge and skipping nodata neighbours, leaving nodata cells alone
+  rather than growing the data area. `zonal_stats(values, zones)` returns one
+  `ZoneStats` row per distinct zone label, counting a cell only where both
+  grids carry data. `rasterize(polygons, ...)` burns `RegionPolygon`s onto a
+  grid by cell centre with holes cut out, the inverse of `polygonize`, which
+  is what turns a set of boundaries into a zone raster. Note the y axis
+  differs: `polygonize` counts rows downward, `rasterize` reads north-up.
+  All three are in `terrano-wasm`; `focalStats` takes no cell size because
+  its window is measured in cells, and `zonalStats` returns flat rows of
+  [zone, count, min, max, mean, sum, std, median].
+
 - `polygonize` (2026-08-04): raster to vector, the classification counterpart
   to `contours`. Connected runs of exactly equal cells (4-connected, nodata
   bounding them) become `RegionPolygon`s whose rings follow cell corners,
