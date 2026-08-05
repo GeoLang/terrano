@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `polygonize` (2026-08-04): raster to vector, the classification counterpart
+  to `contours`. Connected runs of exactly equal cells (4-connected, nodata
+  bounding them) become `RegionPolygon`s whose rings follow cell corners,
+  exterior first then its holes, with collinear runs collapsed so a rectangle
+  is five vertices rather than one per cell edge. A region that pinches at a
+  corner comes back as one polygon per lobe rather than a self-crossing ring.
+  Exposed in `terrano-wasm` flat-encoded as [value, ring_count, (vertex_count,
+  x, y, ...) per ring].
+
 - `terrano-wasm` (2026-08-04): wasm-bindgen surface over terrano-core for the
   browser, free functions over flat f64 buffers (hillshade, slope, aspect,
   fill_sinks, reclassify, unary/binary algebra, normalized difference,

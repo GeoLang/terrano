@@ -18,6 +18,7 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 - **Sink filling** — Remove depressions for hydrologically-correct DEMs
 - **Map algebra** — Unary (add, multiply, sqrt, abs, log) and binary (add, subtract, multiply, divide, min, max) operations
 - **Reclassification** — Value-range-based class assignment
+- **Polygonize** — Connected runs of equal cells traced as polygon rings with holes, for a classified raster
 - **GeoTIFF I/O** — Read and write GeoTIFF rasters with CRS metadata
 - **Multi-band rasters** — `BandedRaster` holds RGB/RGBA or any band set on one grid, written and read as a multi-band GeoTIFF with 8-bit or 64-bit float samples
 - **Cloud Optimized GeoTIFF (COG)** — tiled writing with overview pyramids (raw or deflate), and windowed reads over a byte-range seam (`CogReader` fetches only the tiles a window touches, wire it to `Range` requests for remote streaming). Reads real-world single-band COGs: deflate, horizontal and floating-point predictors, integer and float sample types, GDAL nodata mapped to NaN. Multi-band COGs are pixel-interleaved through `write_cog_bands` and `CogReader::read_window_bands`
@@ -28,7 +29,7 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 
 ```rust
 use terrano_core::{
-    Raster, slope, hillshade, aspect, contours, flow_direction,
+    Raster, slope, hillshade, aspect, contours, polygonize, reclassify, flow_direction,
     flow_accumulation, watershed, read_geotiff, write_geotiff,
 };
 
@@ -43,6 +44,9 @@ let asp = aspect(&dem);
 
 // Contour lines every 10m, starting at 0
 let lines = contours(&dem, 10.0, 0.0);
+
+// Classified raster to polygons
+let regions = polygonize(&reclassify(&dem, &[(0.0, 500.0, 1.0), (500.0, 2000.0, 2.0)]));
 
 // Hydrology
 let flow_dir = flow_direction(&dem);

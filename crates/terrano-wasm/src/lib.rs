@@ -4,6 +4,8 @@
 //! its own parameters and returns a new buffer of the same shape. Contours
 //! come back flat-encoded, [level, vertex_count, x0, y0, x1, y1, ...] per
 //! line, because nested structs would otherwise be serialized per vertex.
+//! Polygons nest one level deeper: [value, ring_count, (vertex_count, x0, y0,
+//! ...) per ring], exterior ring first.
 
 use terrano_core::{BinaryOp, Raster, UnaryOp};
 use wasm_bindgen::prelude::*;
@@ -192,6 +194,31 @@ pub fn contours(
     Ok(flat)
 }
 
+#[wasm_bindgen]
+pub fn polygonize(
+    data: &[f64],
+    width: usize,
+    height: usize,
+    cell_size: f64,
+    nodata: f64,
+) -> Result<Vec<f64>, JsError> {
+    let src = raster(data, width, height, cell_size, nodata)?;
+    let polygons = terrano_core::polygonize(&src);
+    let mut flat = Vec::new();
+    for polygon in polygons {
+        flat.push(polygon.value);
+        flat.push(polygon.rings.len() as f64);
+        for ring in polygon.rings {
+            flat.push(ring.len() as f64);
+            for (x, y) in ring {
+                flat.push(x);
+                flat.push(y);
+            }
+        }
+    }
+    Ok(flat)
+}
+
 // happy paths only: constructing a JsError aborts off wasm, so the error arms
 // are exercised by the browser tests in the consuming viewer instead
 #[cfg(test)]
@@ -274,6 +301,33 @@ mod tests {
         }
         assert_eq!(i, flat.len(), "flat encoding parses exactly");
         assert!(levels.contains(&5.0), "{levels:?}");
+    }
+
+    #[test]
+    fn polygonize_flat_encodes_value_rings_then_vertices() {
+        // a 5 block inside a 1 field, so one polygon carries a hole
+        let mut data = vec![1.0; 16];
+        for i in [5, 6, 9, 10] {
+            data[i] = 5.0;
+        }
+        let flat = polygonize(&data, 4, 4, 1.0, NODATA).unwrap();
+
+        let mut i = 0;
+        let mut shapes = Vec::new();
+        while i < flat.len() {
+            let value = flat[i];
+            let rings = flat[i + 1] as usize;
+            i += 2;
+            for _ in 0..rings {
+                let n = flat[i] as usize;
+                assert!(n >= 4, "a ring closes on at least four vertices");
+                i += 1 + n * 2;
+            }
+            shapes.push((value, rings));
+        }
+        assert_eq!(i, flat.len(), "flat encoding parses exactly");
+        assert!(shapes.contains(&(5.0, 1)), "{shapes:?}");
+        assert!(shapes.contains(&(1.0, 2)), "{shapes:?}");
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod geotiff;
 pub mod grib;
 mod hydrology;
 pub mod netcdf;
+mod polygonize;
 mod raster;
 mod terrain;
 mod timeseries;
@@ -30,6 +31,7 @@ pub use geotiff::{
     write_geotiff_bands,
 };
 pub use hydrology::{flow_accumulation, flow_direction};
+pub use polygonize::{RegionPolygon, polygonize};
 pub use raster::Raster;
 pub use terrain::{aspect, hillshade, slope};
 pub use timeseries::{ChangeResult, CompositeMethod, PhenologyMetrics, RasterStack, TrendResult};
