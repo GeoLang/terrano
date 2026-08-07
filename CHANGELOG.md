@@ -44,6 +44,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `aspect` (2026-08-06) now delivers its documented compass convention:
+  degrees clockwise from north, where it previously returned the raw
+  counterclockwise-from-east atan2 angle. Flat cells (zero gradient) keep
+  nodata instead of reading as south-facing, the same treatment the
+  nodata-gradient ring already got.
 - `write_cog` produced files whose tile offsets pointed into IFD bytes (the per-IFD size bookkeeping undercounted the geo arrays), and `pack_geokeys` silently dropped the EPSG code. COGs now carry a valid GeoKeyDirectory and correct tile offsets, verified by read-back tests.
 
 ## [0.1.0] - 2026-05-30
