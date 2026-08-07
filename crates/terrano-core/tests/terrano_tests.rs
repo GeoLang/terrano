@@ -237,9 +237,9 @@ fn test_hillshade_range() {
 #[test]
 fn test_aspect_flat_terrain() {
     let result = aspect(&flat_dem());
-    // Flat terrain has 0 gradient → aspect is somewhat undefined but should not crash
+    // Flat terrain has 0 gradient → aspect is undefined, cells keep nodata
     let v = result.get(2, 2).unwrap();
-    assert!((0.0..360.0).contains(&v));
+    assert!(result.is_nodata(v));
 }
 
 #[test]

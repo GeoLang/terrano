@@ -57,6 +57,10 @@ pub fn aspect(dem: &Raster) -> Raster {
             if dzdx.is_nan() || dzdy.is_nan() {
                 continue;
             }
+            if dzdx == 0.0 && dzdy == 0.0 {
+                // aspect is undefined on flat cells, leave nodata
+                continue;
+            }
             let mut a = dzdy.atan2(-dzdx).to_degrees();
             if a < 0.0 {
                 a += 360.0;
