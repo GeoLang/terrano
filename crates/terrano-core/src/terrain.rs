@@ -61,10 +61,9 @@ pub fn aspect(dem: &Raster) -> Raster {
                 // aspect is undefined on flat cells, leave nodata
                 continue;
             }
-            let mut a = dzdy.atan2(-dzdx).to_degrees();
-            if a < 0.0 {
-                a += 360.0;
-            }
+            // atan2 measures counterclockwise from east, compass aspect
+            // measures clockwise from north
+            let a = (90.0 - dzdy.atan2(-dzdx).to_degrees()).rem_euclid(360.0);
             result.set(row, col, a);
         }
     }

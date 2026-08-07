@@ -244,11 +244,11 @@ fn test_aspect_flat_terrain() {
 
 #[test]
 fn test_aspect_eastward_slope() {
-    // Slope increases going east (col increases)
+    // Slope increases going east (col increases), so the downslope
+    // direction of steepest descent faces west: compass 270
     let result = aspect(&sloped_dem());
     let a = result.get(2, 2).unwrap();
-    // Aspect indicates direction of steepest descent — verify it's a valid angle
-    assert!((0.0..360.0).contains(&a), "aspect out of range: {a}");
+    assert!((a - 270.0).abs() < 1e-9, "aspect should be 270, got {a}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
