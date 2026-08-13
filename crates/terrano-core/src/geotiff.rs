@@ -17,31 +17,129 @@ pub struct GeoTiffMetadata {
 }
 
 /// Sample layout used when writing raster values.
+///
+/// Integer formats round to the nearest whole number and clamp to their own
+/// range, so an out-of-range value is pinned to the nearest end rather than
+/// wrapping, and NaN lands on zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleFormat {
-    /// Unsigned 8-bit samples; values are rounded and clamped to 0..=255.
     U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+    F32,
     /// 64-bit IEEE floats, as written by [`write_geotiff`].
     F64,
 }
 
 impl SampleFormat {
-    fn bits(self) -> u16 {
+    /// Every format, in the order used to resolve a name or a TIFF tag pair.
+    pub const ALL: [SampleFormat; 8] = [
+        SampleFormat::U8,
+        SampleFormat::I8,
+        SampleFormat::U16,
+        SampleFormat::I16,
+        SampleFormat::U32,
+        SampleFormat::I32,
+        SampleFormat::F32,
+        SampleFormat::F64,
+    ];
+
+    /// TIFF BitsPerSample.
+    pub fn bits(self) -> u16 {
         match self {
-            SampleFormat::U8 => 8,
+            SampleFormat::U8 | SampleFormat::I8 => 8,
+            SampleFormat::U16 | SampleFormat::I16 => 16,
+            SampleFormat::U32 | SampleFormat::I32 | SampleFormat::F32 => 32,
             SampleFormat::F64 => 64,
         }
     }
 
-    fn bytes(self) -> u32 {
+    pub fn bytes(self) -> u32 {
         u32::from(self.bits()) / 8
     }
 
-    /// TIFF SampleFormat tag value: 1 = unsigned integer, 3 = IEEE float.
-    fn tag_value(self) -> u16 {
+    /// TIFF SampleFormat tag value: 1 = unsigned, 2 = signed, 3 = IEEE float.
+    pub fn tag_value(self) -> u16 {
         match self {
-            SampleFormat::U8 => 1,
-            SampleFormat::F64 => 3,
+            SampleFormat::U8 | SampleFormat::U16 | SampleFormat::U32 => 1,
+            SampleFormat::I8 | SampleFormat::I16 | SampleFormat::I32 => 2,
+            SampleFormat::F32 | SampleFormat::F64 => 3,
+        }
+    }
+
+    /// Short name accepted by the wasm binding, e.g. `"u8"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            SampleFormat::U8 => "u8",
+            SampleFormat::I8 => "i8",
+            SampleFormat::U16 => "u16",
+            SampleFormat::I16 => "i16",
+            SampleFormat::U32 => "u32",
+            SampleFormat::I32 => "i32",
+            SampleFormat::F32 => "f32",
+            SampleFormat::F64 => "f64",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.name() == name)
+    }
+
+    /// The format a TIFF declares through BitsPerSample and SampleFormat.
+    pub fn from_tiff(bits: u16, tag_value: u16) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|f| f.bits() == bits && f.tag_value() == tag_value)
+    }
+
+    /// Lowest and highest representable value, `None` for the float formats.
+    pub fn integer_range(self) -> Option<(f64, f64)> {
+        match self {
+            SampleFormat::U8 => Some((0.0, 255.0)),
+            SampleFormat::I8 => Some((-128.0, 127.0)),
+            SampleFormat::U16 => Some((0.0, 65535.0)),
+            SampleFormat::I16 => Some((-32768.0, 32767.0)),
+            SampleFormat::U32 => Some((0.0, 4294967295.0)),
+            SampleFormat::I32 => Some((-2147483648.0, 2147483647.0)),
+            SampleFormat::F32 | SampleFormat::F64 => None,
+        }
+    }
+
+    /// Append one little-endian sample.
+    pub(crate) fn encode(self, value: f64, out: &mut Vec<u8>) {
+        let value = match self.integer_range() {
+            // a saturating cast, so NaN lands on 0
+            Some((low, high)) => value.round().clamp(low, high),
+            None => value,
+        };
+        match self {
+            SampleFormat::U8 => out.push(value as u8),
+            SampleFormat::I8 => out.extend_from_slice(&(value as i8).to_le_bytes()),
+            SampleFormat::U16 => out.extend_from_slice(&(value as u16).to_le_bytes()),
+            SampleFormat::I16 => out.extend_from_slice(&(value as i16).to_le_bytes()),
+            SampleFormat::U32 => out.extend_from_slice(&(value as u32).to_le_bytes()),
+            SampleFormat::I32 => out.extend_from_slice(&(value as i32).to_le_bytes()),
+            SampleFormat::F32 => out.extend_from_slice(&(value as f32).to_le_bytes()),
+            SampleFormat::F64 => out.extend_from_slice(&value.to_le_bytes()),
+        }
+    }
+
+    /// Widen one little-endian sample from the start of `bytes`.
+    pub(crate) fn decode(self, bytes: &[u8]) -> f64 {
+        let two = || u16::from_le_bytes(bytes[..2].try_into().unwrap());
+        let four = || u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        match self {
+            SampleFormat::U8 => f64::from(bytes[0]),
+            SampleFormat::I8 => f64::from(bytes[0] as i8),
+            SampleFormat::U16 => f64::from(two()),
+            SampleFormat::I16 => f64::from(two() as i16),
+            SampleFormat::U32 => f64::from(four()),
+            SampleFormat::I32 => f64::from(four() as i32),
+            SampleFormat::F32 => f64::from(f32::from_bits(four())),
+            SampleFormat::F64 => f64::from_le_bytes(bytes[..8].try_into().unwrap()),
         }
     }
 }
@@ -67,91 +165,21 @@ pub fn write_geotiff<W: Write>(
     let sample_size: u32 = 8; // f64
     let strip_byte_count = width * height * sample_size;
 
-    // We'll write a little-endian TIFF
-    let mut buf: Vec<u8> = Vec::new();
-
-    // TIFF Header (8 bytes)
-    buf.write_all(b"II")?; // Little-endian
-    write_u16(&mut buf, 42)?; // Magic
-    write_u32(&mut buf, 8)?; // Offset to first IFD (immediately after header)
-
-    // Wait - IFD comes after header. Let's plan the layout:
-    // [0..8] = header
-    // [8..] = IFD
-    // After IFD: tag data (tiepoint, pixel scale, geokeys), then strip data
-
-    // GeoTIFF-specific tag data we'll need to write after the IFD:
     let tiepoint: [f64; 6] = [0.0, 0.0, 0.0, meta.origin_x, meta.origin_y, 0.0];
     let pixel_scale: [f64; 3] = [meta.pixel_width, meta.pixel_height, 0.0];
-
     let geo_keys = geo_keys_for(meta.epsg);
 
-    // Number of IFD entries
-    let num_tags: u16 = 11;
+    let num_tags: u16 = 13;
     let ifd_start: u32 = 8;
     let ifd_size: u32 = 2 + (num_tags as u32) * 12 + 4; // count + entries + next_ifd
-    let data_start: u32 = ifd_start + ifd_size;
 
-    // Layout of extra data after IFD:
-    let tiepoint_offset = data_start;
-    let tiepoint_size = 48u32; // 6 * 8
-    let pixel_scale_offset = tiepoint_offset + tiepoint_size;
-    let pixel_scale_size = 24u32; // 3 * 8
-    let geo_keys_offset = pixel_scale_offset + pixel_scale_size;
-    let geo_keys_size = (geo_keys.len() as u32) * 2;
-    let strip_offset = geo_keys_offset + geo_keys_size;
+    // layout after the ifd, in the order these blocks are written below
+    let tiepoint_offset = ifd_start + ifd_size;
+    let pixel_scale_offset = tiepoint_offset + 48;
+    let geo_keys_offset = pixel_scale_offset + 24;
+    let strip_offset = geo_keys_offset + geo_keys.len() as u32 * 2;
 
-    // Re-build buffer from scratch
-    buf.clear();
-
-    // TIFF header
-    buf.write_all(b"II")?;
-    write_u16(&mut buf, 42)?;
-    write_u32(&mut buf, ifd_start)?;
-
-    // IFD entry count
-    write_u16(&mut buf, num_tags)?;
-
-    // Tag entries (must be sorted by tag number)
-    // 256: ImageWidth
-    write_ifd_entry(&mut buf, 256, 3, 1, width)?;
-    // 257: ImageLength
-    write_ifd_entry(&mut buf, 257, 3, 1, height)?;
-    // 258: BitsPerSample
-    write_ifd_entry(&mut buf, 258, 3, 1, 64)?;
-    // 259: Compression (1 = None)
-    write_ifd_entry(&mut buf, 259, 3, 1, 1)?;
-    // 262: PhotometricInterpretation (1 = MinIsBlack)
-    write_ifd_entry(&mut buf, 262, 3, 1, 1)?;
-    // 273: StripOffsets
-    write_ifd_entry(&mut buf, 273, 4, 1, strip_offset)?;
-    // 277: SamplesPerPixel
-    write_ifd_entry(&mut buf, 277, 3, 1, 1)?;
-    // 278: RowsPerStrip
-    write_ifd_entry(&mut buf, 278, 3, 1, height)?;
-    // 279: StripByteCounts
-    write_ifd_entry(&mut buf, 279, 4, 1, strip_byte_count)?;
-    // 339: SampleFormat (3 = IEEE floating point)
-    write_ifd_entry(&mut buf, 339, 3, 1, 3)?;
-    // 33550: ModelPixelScaleTag (DOUBLE, count=3)
-    write_ifd_entry(&mut buf, 33550, 12, 3, pixel_scale_offset)?;
-
-    // We need to also fit ModelTiepointTag (33922) and GeoKeyDirectoryTag (34735)
-    // But we only have 11 tags. Let me add them.
-    // Actually let me recalculate with 13 tags total.
-
-    // Let me redo this properly with all needed tags.
-    buf.clear();
-
-    let num_tags: u16 = 13;
-    let ifd_size: u32 = 2 + (num_tags as u32) * 12 + 4;
-    let data_start: u32 = ifd_start + ifd_size;
-
-    let tiepoint_offset = data_start;
-    let pixel_scale_offset = tiepoint_offset + tiepoint_size;
-    let geo_keys_offset = pixel_scale_offset + pixel_scale_size;
-    let geo_keys_size = (geo_keys.len() as u32) * 2;
-    let strip_offset = geo_keys_offset + geo_keys_size;
+    let mut buf: Vec<u8> = Vec::with_capacity((strip_offset + strip_byte_count) as usize);
 
     // TIFF header
     buf.write_all(b"II")?;
@@ -321,11 +349,7 @@ pub fn write_geotiff_bands<W: Write>(
         for col in 0..raster.width() {
             for band in raster.bands() {
                 let val = band.get(row, col).unwrap_or(band.nodata);
-                match format {
-                    // saturating cast, so NaN lands on 0
-                    SampleFormat::U8 => buf.push(val.round().clamp(0.0, 255.0) as u8),
-                    SampleFormat::F64 => write_f64(&mut buf, val)?,
-                }
+                format.encode(val, &mut buf);
             }
         }
     }
@@ -336,10 +360,9 @@ pub fn write_geotiff_bands<W: Write>(
 
 /// Read a multi-band GeoTIFF written by [`write_geotiff_bands`].
 ///
-/// Supports uncompressed, single-strip, pixel-interleaved files with 8-bit
-/// unsigned or 64-bit float samples. A single-band file reads back as a
-/// one-band raster; band names are not carried by the file, so bands come back
-/// unnamed.
+/// Supports uncompressed, single-strip, pixel-interleaved files in any
+/// [`SampleFormat`]. A single-band file reads back as a one-band raster; band
+/// names are not carried by the file, so bands come back unnamed.
 pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata), Error> {
     let ifd_offset = first_ifd_offset(data)?;
     let num_entries = read_u16_at(data, ifd_offset) as usize;
@@ -406,14 +429,10 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
     {
         return Err(Error::Format("mixed sample types not supported".into()));
     }
-    let format = match (bits, sample_format) {
-        (8, 1) => SampleFormat::U8,
-        (64, 3) => SampleFormat::F64,
-        _ => {
-            return Err(Error::Format(format!(
-                "unsupported sample layout: {bits} bits, format {sample_format}"
-            )));
-        }
+    let Some(format) = SampleFormat::from_tiff(bits, sample_format) else {
+        return Err(Error::Format(format!(
+            "unsupported sample layout: {bits} bits, format {sample_format}"
+        )));
     };
 
     let sample_bytes = format.bytes() as usize;
@@ -437,10 +456,7 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
         let mut values = Vec::with_capacity(pixels);
         for pixel in 0..pixels {
             let off = base + (pixel * samples as usize + band) * sample_bytes;
-            values.push(match format {
-                SampleFormat::U8 => f64::from(data[off]),
-                SampleFormat::F64 => read_f64_at(data, off),
-            });
+            values.push(format.decode(&data[off..]));
         }
         bands.push(Raster::from_vec(
             width as usize,
@@ -896,6 +912,56 @@ mod tests {
         let (read, meta) = read_geotiff_bands(&buf).unwrap();
         assert_bands_eq(&[values], &read);
         assert_eq!(meta.epsg, 32632);
+    }
+
+    #[test]
+    fn sample_format_names_and_tiff_pairs_agree() {
+        for format in SampleFormat::ALL {
+            assert_eq!(SampleFormat::from_name(format.name()), Some(format));
+            assert_eq!(
+                SampleFormat::from_tiff(format.bits(), format.tag_value()),
+                Some(format)
+            );
+        }
+        assert_eq!(SampleFormat::from_name("float64"), None);
+        assert_eq!(SampleFormat::from_tiff(24, 1), None);
+    }
+
+    #[test]
+    fn test_geotiff_bands_roundtrip_every_format() {
+        for format in SampleFormat::ALL {
+            // inside every format's range, and exact in f32
+            let values = vec![0.0, 12.0, 100.0, 5.0, 64.0, 1.0];
+            let raster = BandedRaster::new(vec![band_of(values.clone())]).unwrap();
+
+            let mut buf = Vec::new();
+            write_geotiff_bands(&raster, &utm_meta(), format, &mut buf).unwrap();
+            assert_eq!(
+                ifd_tag(&buf, 258).unwrap().1,
+                u32::from(format.bits()),
+                "{} bits",
+                format.name()
+            );
+            assert_eq!(
+                ifd_tag(&buf, 339).unwrap().1,
+                u32::from(format.tag_value()),
+                "{} sample format",
+                format.name()
+            );
+
+            let (read, _) = read_geotiff_bands(&buf).unwrap();
+            assert_bands_eq(&[values], &read);
+        }
+    }
+
+    #[test]
+    fn test_geotiff_bands_signed_samples_survive() {
+        let values = vec![-128.0, -1.0, 0.0, 1.0, 127.0, -64.0];
+        let raster = BandedRaster::new(vec![band_of(values.clone())]).unwrap();
+        let mut buf = Vec::new();
+        write_geotiff_bands(&raster, &utm_meta(), SampleFormat::I8, &mut buf).unwrap();
+        let (read, _) = read_geotiff_bands(&buf).unwrap();
+        assert_bands_eq(&[values], &read);
     }
 
     #[test]

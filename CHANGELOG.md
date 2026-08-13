@@ -6,10 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- COG sample formats (2026-08-13): `CogParams::format` writes u8, i8, u16,
+  i16, u32, i32, f32 or f64 tiles, matching what the reader already decoded.
+  It defaults to f64, so existing callers are unchanged, and an 8-bit image
+  written as u8 is an eighth the size it was. `SampleFormat` grew from two
+  variants to those eight and now also drives `write_geotiff_bands` and
+  `read_geotiff_bands`, which read and write every one of them. `writeCog` in
+  `terrano-wasm` takes the format by name, e.g. `"u16"`.
+
+  Samples round to the nearest whole number and clamp to the format's range
+  rather than wrapping, and overviews are averaged in f64 and rounded only
+  when a tile is encoded. Nodata on an integer format is an ordinary sample
+  value set aside to mean absent: it has to be whole and inside the range,
+  and NaN samples are written as it. With no nodata declared, an integer file
+  rejects NaN samples rather than storing a silent zero. An f32 nodata has to
+  survive the narrowing, so a value like 0.1 is rejected. Output for every
+  format passes `validate_cloud_optimized_geotiff.py --full-check=yes`, and
+  gdalinfo reports the declared type, the nodata value and all three overview
+  levels.
+
 - `writeCog` in `terrano-wasm` (2026-08-13): COG encoding from the browser,
   taking a flat f64 buffer plus georeferencing and returning the file bytes.
   terrano-core builds for wasm32-unknown-unknown with no C dependencies,
   flate2 resolving to pure-Rust miniz_oxide, so deflate works there too.
+
+### Fixed
+
+- `write_geotiff` (2026-08-13): built and discarded its output buffer twice
+  before the pass that counted, so every call did the work three times.
 
 - `focal_stats`, `zonal_stats` and `rasterize` (2026-08-04): the neighbourhood
   and grouped summaries, plus the polygon burn that feeds them.

@@ -6,9 +6,9 @@
 //! `Range`-request http transport streams remote files without downloading
 //! them. The read side covers real-world cogs: uncompressed or deflate
 //! tiles, horizontal and floating-point predictors, integer and float
-//! sample types (decoded to f64, nodata mapped to NaN). The writer produces
-//! 64-bit float tiles, raw or deflate, and its output passes GDAL's
-//! `validate_cloud_optimized_geotiff.py`.
+//! sample types (decoded to f64, nodata mapped to NaN). The writer covers
+//! the same sample types through [`CogParams::format`], raw or deflate, and
+//! its output passes GDAL's `validate_cloud_optimized_geotiff.py`.
 //!
 //! Multi-band files are pixel-interleaved (PlanarConfiguration 1) and go
 //! through [`write_cog_bands`] and [`CogReader::read_window_bands`]. The
@@ -19,7 +19,7 @@
 
 use crate::Error;
 use crate::banded::BandedRaster;
-use crate::geotiff::GeoTiffMetadata;
+use crate::geotiff::{GeoTiffMetadata, SampleFormat};
 use crate::raster::Raster;
 use std::io::{self, Write};
 
@@ -46,9 +46,22 @@ pub struct CogParams {
     pub deflate: bool,
     /// Value declared as GDAL_NODATA and substituted for NaN samples.
     ///
-    /// `None` writes no nodata tag and leaves NaN in the file, which only
-    /// readers that treat NaN as absent will understand.
+    /// On a float format, `None` writes no nodata tag and leaves NaN in the
+    /// file, which only readers that treat NaN as absent will understand.
+    ///
+    /// An integer format has no NaN, so nodata is an ordinary sample value
+    /// set aside to mean absent: it has to be whole and inside the format's
+    /// range, and every NaN in the source is written as it. With `None` an
+    /// integer file declares no absent value at all, so a NaN sample is an
+    /// error rather than a silent zero, and only the padding past the image
+    /// edge is filled with zero.
     pub nodata: Option<f64>,
+    /// Sample type of the tiles, [`SampleFormat::F64`] by default.
+    ///
+    /// The integer formats round to the nearest whole number and clamp to
+    /// their range, both for the source samples and for the block averages
+    /// that build the overviews.
+    pub format: SampleFormat,
 }
 
 impl Default for CogParams {
@@ -64,6 +77,7 @@ impl Default for CogParams {
             pixel_height: 1.0,
             deflate: false,
             nodata: Some(f64::NAN),
+            format: SampleFormat::F64,
         }
     }
 }
@@ -192,7 +206,7 @@ fn write_bands<W: Write>(
         .collect();
     let overviews = &per_band[0];
 
-    let fill = params.nodata.unwrap_or(f64::NAN);
+    check_nodata(params.format, params.nodata)?;
     let mut all_tile_data: Vec<Vec<Vec<u8>>> = Vec::new();
     let planes: Vec<&[f64]> = bands.iter().map(|b| b.data()).collect();
     all_tile_data.push(bands_to_tiles(
@@ -201,8 +215,9 @@ fn write_bands<W: Write>(
         height,
         params.tile_width as usize,
         params.tile_height as usize,
-        fill,
-    ));
+        params.format,
+        params.nodata,
+    )?);
     for (i, ov) in overviews.iter().enumerate() {
         let planes: Vec<&[f64]> = per_band.iter().map(|b| b[i].data.as_slice()).collect();
         all_tile_data.push(bands_to_tiles(
@@ -211,8 +226,9 @@ fn write_bands<W: Write>(
             ov.height,
             params.tile_width as usize,
             params.tile_height as usize,
-            fill,
-        ));
+            params.format,
+            params.nodata,
+        )?);
     }
     if params.deflate {
         for tiles in &mut all_tile_data {
@@ -344,7 +360,7 @@ pub fn extract_tile(
     tile
 }
 
-/// Split raster data into tiles, returning raw f64 bytes per tile.
+/// Split raster data into tiles, returning raw sample bytes per tile.
 #[cfg(test)]
 fn raster_to_tiles(
     data: &[f64],
@@ -353,10 +369,43 @@ fn raster_to_tiles(
     tile_w: usize,
     tile_h: usize,
 ) -> Vec<Vec<u8>> {
-    bands_to_tiles(&[data], width, height, tile_w, tile_h, f64::NAN)
+    bands_to_tiles(
+        &[data],
+        width,
+        height,
+        tile_w,
+        tile_h,
+        SampleFormat::F64,
+        None,
+    )
+    .expect("a float format takes any sample")
 }
 
-/// Split per-band planes into pixel-interleaved tiles of raw f64 bytes.
+/// Reject a nodata value the chosen format cannot store exactly.
+///
+/// Declaring one value in GDAL_NODATA and storing another would leave the
+/// absent cells looking like data.
+fn check_nodata(format: SampleFormat, nodata: Option<f64>) -> Result<(), Error> {
+    let Some(value) = nodata else {
+        return Ok(());
+    };
+    let representable = match format.integer_range() {
+        Some((low, high)) => {
+            value.is_finite() && value.fract() == 0.0 && value >= low && value <= high
+        }
+        None if format == SampleFormat::F32 => value.is_nan() || f64::from(value as f32) == value,
+        None => true,
+    };
+    if representable {
+        return Ok(());
+    }
+    Err(Error::InvalidInput(format!(
+        "nodata {value} is not exactly representable as {}",
+        format.name()
+    )))
+}
+
+/// Split per-band planes into pixel-interleaved tiles of raw sample bytes.
 ///
 /// `nodata` fills the padding past the image edge and replaces NaN samples,
 /// so the value the file declares absent is the one actually stored.
@@ -366,15 +415,19 @@ fn bands_to_tiles(
     height: usize,
     tile_w: usize,
     tile_h: usize,
-    nodata: f64,
-) -> Vec<Vec<u8>> {
+    format: SampleFormat,
+    nodata: Option<f64>,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let integer = format.integer_range().is_some();
+    let padding = nodata.unwrap_or(if integer { 0.0 } else { f64::NAN });
     let tiles_across = width.div_ceil(tile_w);
     let tiles_down = height.div_ceil(tile_h);
     let mut tiles = Vec::with_capacity(tiles_across * tiles_down);
+    let sample_bytes = format.bytes() as usize;
 
     for tr in 0..tiles_down {
         for tc in 0..tiles_across {
-            let mut tile_data = Vec::with_capacity(tile_w * tile_h * planes.len() * 8);
+            let mut tile_data = Vec::with_capacity(tile_w * tile_h * planes.len() * sample_bytes);
             for ty in 0..tile_h {
                 let src_y = tr * tile_h + ty;
                 for tx in 0..tile_w {
@@ -384,12 +437,22 @@ fn bands_to_tiles(
                         let mut val = if inside {
                             plane[src_y * width + src_x]
                         } else {
-                            nodata
+                            padding
                         };
                         if val.is_nan() {
-                            val = nodata;
+                            match nodata {
+                                Some(declared) => val = declared,
+                                None if integer => {
+                                    return Err(Error::InvalidInput(
+                                        "an integer cog has no NaN, set CogParams::nodata to the \
+                                         value that means absent"
+                                            .into(),
+                                    ));
+                                }
+                                None => {}
+                            }
                         }
-                        tile_data.extend_from_slice(&val.to_le_bytes());
+                        format.encode(val, &mut tile_data);
                     }
                 }
             }
@@ -397,7 +460,7 @@ fn bands_to_tiles(
         }
     }
 
-    tiles
+    Ok(tiles)
 }
 
 /// entries every level carries: 256, 257, 258, 259, 262, 277, 322, 323,
@@ -540,7 +603,12 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
     }
     push_entry(&mut buf, 256, 3, 1, args.width);
     push_entry(&mut buf, 257, 3, 1, args.height);
-    let bits_value = if samples > 2 { bits_off } else { packed(64) };
+    let format = args.params.format;
+    let bits_value = if samples > 2 {
+        bits_off
+    } else {
+        packed(u32::from(format.bits()))
+    };
     push_entry(&mut buf, 258, 3, samples as u32, bits_value);
     push_entry(&mut buf, 259, 3, 1, if args.params.deflate { 8 } else { 1 });
     push_entry(&mut buf, 262, 3, 1, 1);
@@ -571,7 +639,11 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
         };
         push_entry(&mut buf, 338, 3, layout.extra_samples() as u32, value);
     }
-    let format_value = if samples > 2 { formats_off } else { packed(3) };
+    let format_value = if samples > 2 {
+        formats_off
+    } else {
+        packed(u32::from(format.tag_value()))
+    };
     push_entry(&mut buf, 339, 3, samples as u32, format_value);
     push_entry(&mut buf, 33550, 12, 3, scale_off);
     push_entry(&mut buf, 33922, 12, 6, tiepoint_off);
@@ -631,10 +703,10 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
 
     if samples > 2 {
         for _ in 0..samples {
-            push_u16(&mut buf, 64);
+            push_u16(&mut buf, format.bits());
         }
         for _ in 0..samples {
-            push_u16(&mut buf, 3);
+            push_u16(&mut buf, format.tag_value());
         }
     }
 
@@ -2316,6 +2388,237 @@ mod tests {
         let (ty, count, value) = ifd.entry(338).expect("ExtraSamples");
         assert_eq!((ty, count), (3, 2));
         assert_eq!(value, 0, "both extra bands are unspecified data");
+    }
+
+    fn write_cog_as(raster: &Raster, format: SampleFormat, nodata: Option<f64>) -> Vec<u8> {
+        let params = CogParams {
+            tile_width: 16,
+            tile_height: 16,
+            overview_levels: 2,
+            epsg: 4326,
+            nodata,
+            format,
+            ..CogParams::default()
+        };
+        let mut buf = io::Cursor::new(Vec::new());
+        write_cog(raster, &params, &mut buf).unwrap();
+        buf.into_inner()
+    }
+
+    /// integer values a whole tile wide, so nothing is lost to rounding
+    fn integer_raster(width: usize, height: usize, low: f64, high: f64) -> Raster {
+        let span = high - low + 1.0;
+        let data = (0..width * height)
+            .map(|i| low + (i as f64 * 7.0) % span)
+            .collect();
+        Raster::from_vec(width, height, data, 1.0, -9999.0).unwrap()
+    }
+
+    /// the top of an integer format's range, NaN for a float one: outside
+    /// the values [`integer_raster`] produces, so nothing collides with it
+    fn spare_nodata(format: SampleFormat) -> f64 {
+        format.integer_range().map_or(f64::NAN, |(_, high)| high)
+    }
+
+    #[test]
+    fn every_format_declares_its_bits_and_sample_format() {
+        let raster = integer_raster(40, 40, 0.0, 100.0);
+        for format in SampleFormat::ALL {
+            let bytes = write_cog_as(&raster, format, Some(spare_nodata(format)));
+            for (level, ifd) in ifd_chain(&bytes).iter().enumerate() {
+                assert_eq!(
+                    ifd.value(258),
+                    Some(u32::from(format.bits())),
+                    "{} bits at level {level}",
+                    format.name()
+                );
+                assert_eq!(
+                    ifd.value(339),
+                    Some(u32::from(format.tag_value())),
+                    "{} sample format at level {level}",
+                    format.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_formats_shrink_the_file_and_roundtrip_exactly() {
+        let raster = integer_raster(64, 64, 0.0, 100.0);
+        let wide = write_cog_as(&raster, SampleFormat::F64, Some(f64::NAN));
+
+        for format in SampleFormat::ALL {
+            if format == SampleFormat::F64 {
+                continue;
+            }
+            let bytes = write_cog_as(&raster, format, Some(spare_nodata(format)));
+            assert!(
+                bytes.len() < wide.len(),
+                "{} should be smaller than f64: {} vs {}",
+                format.name(),
+                bytes.len(),
+                wide.len()
+            );
+
+            let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+            let window = reader.read_window(0, 0, 0, 64, 64).unwrap();
+            for (i, (got, want)) in window.data().iter().zip(raster.data()).enumerate() {
+                assert_eq!(got, want, "{} at {i}", format.name());
+            }
+        }
+    }
+
+    #[test]
+    fn signed_formats_carry_negatives_through_base_and_overview() {
+        let raster = integer_raster(32, 32, -2000.0, 2000.0);
+        let bytes = write_cog_as(&raster, SampleFormat::I16, Some(-32768.0));
+
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let base = reader.read_window(0, 0, 0, 32, 32).unwrap();
+        assert_eq!(base.data(), raster.data());
+        assert!(
+            base.data().iter().any(|v| *v < 0.0),
+            "test data has no negatives"
+        );
+
+        // the overview averages in f64 and only rounds on the way out
+        let expected = generate_overviews(&raster, 1);
+        let overview = reader.read_window(1, 0, 0, 16, 16).unwrap();
+        for (got, want) in overview.data().iter().zip(&expected[0].data) {
+            assert_eq!(*got, want.round(), "overview sample");
+        }
+    }
+
+    #[test]
+    fn integer_overviews_round_rather_than_wrap() {
+        // averages land just under the top of the range, where a truncating
+        // cast would wrap to 0
+        let raster =
+            Raster::from_vec(2, 2, vec![255.0, 255.0, 254.0, 255.0], 1.0, -9999.0).unwrap();
+        let bytes = write_cog_as(&raster, SampleFormat::U8, None);
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let overview = reader.read_window(1, 0, 0, 1, 1).unwrap();
+        assert_eq!(overview.data()[0], 255.0, "254.75 should round to 255");
+
+        let raster =
+            Raster::from_vec(2, 2, vec![-128.0, -128.0, -127.0, -128.0], 1.0, -9999.0).unwrap();
+        let bytes = write_cog_as(&raster, SampleFormat::I8, None);
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let overview = reader.read_window(1, 0, 0, 1, 1).unwrap();
+        assert_eq!(overview.data()[0], -128.0, "-127.75 should round to -128");
+    }
+
+    #[test]
+    fn integer_samples_out_of_range_clamp_instead_of_wrapping() {
+        let raster = Raster::from_vec(2, 2, vec![-5.0, 300.0, 12.6, 255.0], 1.0, -9999.0).unwrap();
+        let bytes = write_cog_as(&raster, SampleFormat::U8, None);
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let window = reader.read_window(0, 0, 0, 2, 2).unwrap();
+        assert_eq!(window.data(), &[0.0, 255.0, 13.0, 255.0]);
+    }
+
+    #[test]
+    fn integer_nodata_is_stored_as_itself_and_read_back_as_nan() {
+        let mut raster = integer_raster(40, 40, 0.0, 100.0);
+        raster.set(3, 5, f64::NAN);
+        let bytes = write_cog_as(&raster, SampleFormat::U16, Some(65535.0));
+
+        let ifd = &ifd_chain(&bytes)[0];
+        assert_eq!(nodata_text_of(&bytes, ifd).as_deref(), Some("65535"));
+        let tile = ifd.tile_offsets(&bytes)[0] as usize;
+        assert_eq!(u16_at(&bytes, tile + (3 * 16 + 5) * 2), 65535);
+
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let window = reader.read_window(0, 0, 0, 40, 40).unwrap();
+        assert!(window.get(3, 5).unwrap().is_nan());
+        assert_eq!(window.get(0, 1).unwrap(), raster.get(0, 1).unwrap());
+    }
+
+    #[test]
+    fn an_integer_format_rejects_a_nodata_it_cannot_store() {
+        let raster = integer_raster(20, 20, 0.0, 100.0);
+        for bad in [f64::NAN, -1.0, 300.0, 12.5] {
+            let params = CogParams {
+                format: SampleFormat::U8,
+                nodata: Some(bad),
+                ..CogParams::default()
+            };
+            let mut buf = io::Cursor::new(Vec::new());
+            let err = write_cog(&raster, &params, &mut buf)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("u8"), "nodata {bad}: {err}");
+        }
+
+        // f32 rounds 0.1, so declaring it would leave the file disagreeing
+        // with its own tag
+        let params = CogParams {
+            format: SampleFormat::F32,
+            nodata: Some(0.1),
+            ..CogParams::default()
+        };
+        let mut buf = io::Cursor::new(Vec::new());
+        assert!(write_cog(&raster, &params, &mut buf).is_err());
+    }
+
+    #[test]
+    fn an_integer_format_refuses_nan_samples_with_no_nodata_declared() {
+        let mut raster = integer_raster(20, 20, 0.0, 100.0);
+        raster.set(1, 1, f64::NAN);
+        let params = CogParams {
+            format: SampleFormat::U8,
+            nodata: None,
+            ..CogParams::default()
+        };
+        let mut buf = io::Cursor::new(Vec::new());
+        let err = write_cog(&raster, &params, &mut buf)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nodata"), "{err}");
+    }
+
+    #[test]
+    fn multi_band_integer_cogs_write_per_sample_arrays() {
+        let bands = BandedRaster::new(vec![
+            integer_raster(40, 40, 0.0, 255.0),
+            integer_raster(40, 40, 0.0, 200.0),
+            integer_raster(40, 40, 0.0, 100.0),
+        ])
+        .unwrap();
+        let params = CogParams {
+            tile_width: 16,
+            tile_height: 16,
+            overview_levels: 1,
+            format: SampleFormat::U8,
+            nodata: None,
+            ..CogParams::default()
+        };
+        let mut buf = io::Cursor::new(Vec::new());
+        write_cog_bands(&bands, &params, &mut buf).unwrap();
+        let bytes = buf.into_inner();
+
+        // three samples no longer fit in the entry value field
+        let ifd = &ifd_chain(&bytes)[0];
+        let (_, count, at) = ifd.entry(258).unwrap();
+        assert_eq!(count, 3);
+        for i in 0..3 {
+            assert_eq!(u16_at(&bytes, at as usize + i * 2), 8, "band {i} bits");
+        }
+        let (_, count, at) = ifd.entry(339).unwrap();
+        assert_eq!(count, 3);
+        for i in 0..3 {
+            assert_eq!(u16_at(&bytes, at as usize + i * 2), 1, "band {i} format");
+        }
+
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let read = reader.read_window_bands(0, 0, 0, 40, 40).unwrap();
+        for b in 0..3 {
+            assert_close(
+                read.band(b).unwrap().data(),
+                bands.band(b).unwrap().data(),
+                &format!("band {b}"),
+            );
+        }
     }
 
     #[test]
