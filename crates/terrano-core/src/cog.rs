@@ -7,7 +7,8 @@
 //! them. The read side covers real-world cogs: uncompressed or deflate
 //! tiles, horizontal and floating-point predictors, integer and float
 //! sample types (decoded to f64, nodata mapped to NaN). The writer produces
-//! 64-bit float tiles, raw or deflate.
+//! 64-bit float tiles, raw or deflate, and its output passes GDAL's
+//! `validate_cloud_optimized_geotiff.py`.
 //!
 //! Multi-band files are pixel-interleaved (PlanarConfiguration 1) and go
 //! through [`write_cog_bands`] and [`CogReader::read_window_bands`]. The
@@ -20,7 +21,7 @@ use crate::Error;
 use crate::banded::BandedRaster;
 use crate::geotiff::GeoTiffMetadata;
 use crate::raster::Raster;
-use std::io::{self, Seek, Write};
+use std::io::{self, Write};
 
 /// Configuration for COG output.
 #[derive(Debug, Clone)]
@@ -43,6 +44,11 @@ pub struct CogParams {
     pub pixel_height: f64,
     /// Compress tiles with zlib deflate.
     pub deflate: bool,
+    /// Value declared as GDAL_NODATA and substituted for NaN samples.
+    ///
+    /// `None` writes no nodata tag and leaves NaN in the file, which only
+    /// readers that treat NaN as absent will understand.
+    pub nodata: Option<f64>,
 }
 
 impl Default for CogParams {
@@ -57,6 +63,7 @@ impl Default for CogParams {
             pixel_width: 1.0,
             pixel_height: 1.0,
             deflate: false,
+            nodata: Some(f64::NAN),
         }
     }
 }
@@ -137,13 +144,18 @@ pub fn generate_overviews(raster: &Raster, levels: u32) -> Vec<Overview> {
 ///
 /// The file layout follows the COG specification:
 /// 1. TIFF header (8 bytes)
-/// 2. Full-resolution IFD, then overview IFDs, each followed by its geo
-///    arrays, GeoKey directory, and tile offset/count arrays
-/// 3. Tile data (full resolution first, then overviews)
+/// 2. Full-resolution IFD, then overview IFDs by decreasing resolution,
+///    each followed by its geo arrays, GeoKey directory, and tile
+///    offset/count arrays
+/// 3. Tile data, smallest overview first and full resolution last
 ///
 /// All IFD metadata sits at the start of the file, so a reader learns the
-/// full layout from one small prefix read.
-pub fn write_cog<W: Write + Seek>(
+/// full layout from one small prefix read, and a viewer that only wants a
+/// zoomed-out view stops reading after the overviews.
+///
+/// Overview IFDs carry NewSubfileType, which is what marks them a pyramid
+/// rather than extra pages.
+pub fn write_cog<W: Write>(
     raster: &Raster,
     params: &CogParams,
     writer: &mut W,
@@ -155,7 +167,7 @@ pub fn write_cog<W: Write + Seek>(
 ///
 /// Same layout as [`write_cog`], with SamplesPerPixel set to the band count
 /// and PlanarConfiguration chunky. Overviews are block-averaged per band.
-pub fn write_cog_bands<W: Write + Seek>(
+pub fn write_cog_bands<W: Write>(
     bands: &BandedRaster,
     params: &CogParams,
     writer: &mut W,
@@ -164,7 +176,7 @@ pub fn write_cog_bands<W: Write + Seek>(
     write_bands(&refs, params, writer)
 }
 
-fn write_bands<W: Write + Seek>(
+fn write_bands<W: Write>(
     bands: &[&Raster],
     params: &CogParams,
     writer: &mut W,
@@ -180,6 +192,7 @@ fn write_bands<W: Write + Seek>(
         .collect();
     let overviews = &per_band[0];
 
+    let fill = params.nodata.unwrap_or(f64::NAN);
     let mut all_tile_data: Vec<Vec<Vec<u8>>> = Vec::new();
     let planes: Vec<&[f64]> = bands.iter().map(|b| b.data()).collect();
     all_tile_data.push(bands_to_tiles(
@@ -188,6 +201,7 @@ fn write_bands<W: Write + Seek>(
         height,
         params.tile_width as usize,
         params.tile_height as usize,
+        fill,
     ));
     for (i, ov) in overviews.iter().enumerate() {
         let planes: Vec<&[f64]> = per_band.iter().map(|b| b[i].data.as_slice()).collect();
@@ -197,6 +211,7 @@ fn write_bands<W: Write + Seek>(
             ov.height,
             params.tile_width as usize,
             params.tile_height as usize,
+            fill,
         ));
     }
     if params.deflate {
@@ -211,31 +226,39 @@ fn write_bands<W: Write + Seek>(
     }
 
     // per-ifd byte footprint decides every offset up front
-    let ifd_totals: Vec<usize> = all_tile_data
+    let nodata_text = params.nodata.map(nodata_text);
+    let layouts: Vec<IfdLayout> = all_tile_data
         .iter()
-        .map(|t| ifd_total(t.len(), samples))
+        .enumerate()
+        .map(|(level, tiles)| IfdLayout {
+            samples,
+            n_tiles: tiles.len(),
+            overview: level > 0,
+            nodata: nodata_text.clone(),
+        })
         .collect();
-    let mut ifd_starts = Vec::with_capacity(ifd_totals.len());
+    let mut ifd_starts = Vec::with_capacity(layouts.len());
     let mut at = 8usize;
-    for total in &ifd_totals {
+    for layout in &layouts {
         ifd_starts.push(at);
-        at += total;
+        at += layout.total();
     }
-    let tile_data_start = at;
 
-    let mut tile_offsets: Vec<Vec<u32>> = Vec::new();
-    let mut tile_byte_counts: Vec<Vec<u32>> = Vec::new();
-    let mut current_offset = tile_data_start;
-    for tiles in &all_tile_data {
-        let mut offsets = Vec::new();
-        let mut counts = Vec::new();
-        for tile in tiles {
-            offsets.push(current_offset as u32);
-            counts.push(tile.len() as u32);
-            current_offset += tile.len();
+    // a viewer reading coarse-to-fine wants the small levels first, and the
+    // cog spec requires that order
+    let mut tile_offsets: Vec<Vec<u32>> = vec![Vec::new(); all_tile_data.len()];
+    let mut tile_byte_counts: Vec<Vec<u32>> = vec![Vec::new(); all_tile_data.len()];
+    for level in (0..all_tile_data.len()).rev() {
+        for tile in &all_tile_data[level] {
+            tile_offsets[level].push(at as u32);
+            tile_byte_counts[level].push(tile.len() as u32);
+            at += tile.len();
         }
-        tile_offsets.push(offsets);
-        tile_byte_counts.push(counts);
+    }
+    if at > u32::MAX as usize {
+        return Err(Error::InvalidInput(
+            "image too large for a classic tiff, offsets are 32-bit".into(),
+        ));
     }
 
     writer.write_all(b"II")?;
@@ -268,7 +291,7 @@ fn write_bands<W: Write + Seek>(
             base: ifd_starts[i] as u32,
             width: level_width,
             height: level_height,
-            samples,
+            layout: &layouts[i],
             pixel_width,
             pixel_height,
             params,
@@ -276,11 +299,11 @@ fn write_bands<W: Write + Seek>(
             tile_byte_counts: &tile_byte_counts[i],
             next_ifd_offset: next,
         });
-        debug_assert_eq!(ifd.len(), ifd_totals[i]);
+        debug_assert_eq!(ifd.len(), layouts[i].total());
         writer.write_all(&ifd)?;
     }
 
-    for tiles in &all_tile_data {
+    for tiles in all_tile_data.iter().rev() {
         for tile in tiles {
             writer.write_all(tile)?;
         }
@@ -330,16 +353,20 @@ fn raster_to_tiles(
     tile_w: usize,
     tile_h: usize,
 ) -> Vec<Vec<u8>> {
-    bands_to_tiles(&[data], width, height, tile_w, tile_h)
+    bands_to_tiles(&[data], width, height, tile_w, tile_h, f64::NAN)
 }
 
 /// Split per-band planes into pixel-interleaved tiles of raw f64 bytes.
+///
+/// `nodata` fills the padding past the image edge and replaces NaN samples,
+/// so the value the file declares absent is the one actually stored.
 fn bands_to_tiles(
     planes: &[&[f64]],
     width: usize,
     height: usize,
     tile_w: usize,
     tile_h: usize,
+    nodata: f64,
 ) -> Vec<Vec<u8>> {
     let tiles_across = width.div_ceil(tile_w);
     let tiles_down = height.div_ceil(tile_h);
@@ -354,11 +381,14 @@ fn bands_to_tiles(
                     let src_x = tc * tile_w + tx;
                     let inside = src_x < width && src_y < height;
                     for plane in planes {
-                        let val = if inside {
+                        let mut val = if inside {
                             plane[src_y * width + src_x]
                         } else {
-                            f64::NAN
+                            nodata
                         };
+                        if val.is_nan() {
+                            val = nodata;
+                        }
                         tile_data.extend_from_slice(&val.to_le_bytes());
                     }
                 }
@@ -370,15 +400,15 @@ fn bands_to_tiles(
     tiles
 }
 
-const IFD_ENTRIES: usize = 14;
-const IFD_BYTES: usize = 2 + IFD_ENTRIES * 12 + 4;
-// pixel scale (24) + tiepoint (48) + geokey directory (16)
-const GEO_BYTES: usize = 24 + 48 + 16;
-
-/// multi-band files add PlanarConfiguration
-fn ifd_bytes(samples: usize) -> usize {
-    IFD_BYTES + if samples > 1 { 12 } else { 0 }
-}
+/// entries every level carries: 256, 257, 258, 259, 262, 277, 322, 323,
+/// 324, 325, 339, 33550, 33922, 34735
+const BASE_IFD_ENTRIES: usize = 14;
+/// 4-short header plus GTModelType, GTRasterType and the crs key
+const GEO_KEY_SHORTS: usize = 4 + 3 * 4;
+// pixel scale (24) + tiepoint (48) + geokey directory
+const GEO_BYTES: usize = 24 + 48 + GEO_KEY_SHORTS * 2;
+/// an ascii value of four bytes or fewer sits in the entry value field
+const INLINE_BYTES: usize = 4;
 
 /// BitsPerSample and SampleFormat carry one short per sample, and three or
 /// more no longer fit in the entry value field
@@ -386,18 +416,90 @@ fn sample_array_bytes(samples: usize) -> usize {
     if samples > 2 { samples * 4 } else { 0 }
 }
 
-fn ifd_total(n_tiles: usize, samples: usize) -> usize {
-    ifd_bytes(samples)
-        + GEO_BYTES
-        + sample_array_bytes(samples)
-        + if n_tiles > 1 { n_tiles * 8 } else { 0 }
+/// GDAL_NODATA is ascii, and GDAL spells a non-finite value in lowercase
+fn nodata_text(value: f64) -> String {
+    if value.is_nan() {
+        "nan".into()
+    } else if value.is_infinite() {
+        if value > 0.0 {
+            "inf".into()
+        } else {
+            "-inf".into()
+        }
+    } else {
+        format!("{value}")
+    }
+}
+
+/// Byte layout of one level's IFD.
+///
+/// The size used to place the IFD and the bytes later written for it both
+/// come from here, so they cannot drift apart as optional entries change.
+struct IfdLayout {
+    samples: usize,
+    n_tiles: usize,
+    overview: bool,
+    nodata: Option<String>,
+}
+
+impl IfdLayout {
+    /// bands past the first are unspecified data, and libtiff wants them
+    /// declared: colour channels plus extra samples has to reach
+    /// SamplesPerPixel
+    fn extra_samples(&self) -> usize {
+        self.samples - 1
+    }
+
+    fn extra_sample_bytes(&self) -> usize {
+        if self.extra_samples() > 2 {
+            self.extra_samples() * 2
+        } else {
+            0
+        }
+    }
+
+    fn entries(&self) -> usize {
+        BASE_IFD_ENTRIES
+            + usize::from(self.overview)
+            + 2 * usize::from(self.samples > 1)
+            + usize::from(self.nodata.is_some())
+    }
+
+    fn directory_bytes(&self) -> usize {
+        2 + self.entries() * 12 + 4
+    }
+
+    /// ascii bytes including the terminating nul, zero when it fits inline
+    fn nodata_bytes(&self) -> usize {
+        match &self.nodata {
+            Some(text) if text.len() + 1 > INLINE_BYTES => text.len() + 1,
+            _ => 0,
+        }
+    }
+
+    fn tile_array_bytes(&self) -> usize {
+        if self.n_tiles > 1 {
+            self.n_tiles * 8
+        } else {
+            0
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.directory_bytes()
+            + GEO_BYTES
+            + sample_array_bytes(self.samples)
+            + self.extra_sample_bytes()
+            + self.nodata_bytes()
+            + self.tile_array_bytes()
+    }
 }
 
 struct IfdArgs<'a> {
     base: u32,
     width: u32,
     height: u32,
-    samples: usize,
+    layout: &'a IfdLayout,
     pixel_width: f64,
     pixel_height: f64,
     params: &'a CogParams,
@@ -407,15 +509,18 @@ struct IfdArgs<'a> {
 }
 
 fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
+    let layout = args.layout;
     let n_tiles = args.tile_offsets.len();
-    let samples = args.samples;
-    let aux = args.base + ifd_bytes(samples) as u32;
+    let samples = layout.samples;
+    let aux = args.base + layout.directory_bytes() as u32;
     let scale_off = aux;
     let tiepoint_off = aux + 24;
     let geokeys_off = aux + 72;
     let bits_off = aux + GEO_BYTES as u32;
     let formats_off = bits_off + if samples > 2 { samples as u32 * 2 } else { 0 };
-    let arrays_off = aux + GEO_BYTES as u32 + sample_array_bytes(samples) as u32;
+    let extra_off = aux + GEO_BYTES as u32 + sample_array_bytes(samples) as u32;
+    let nodata_off = extra_off + layout.extra_sample_bytes() as u32;
+    let arrays_off = nodata_off + layout.nodata_bytes() as u32;
 
     // one short per sample: inline while two fit in the value field
     let packed = |value: u32| -> u32 {
@@ -425,14 +530,14 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
             value | (value << 16)
         }
     };
-    let entries = if samples > 1 {
-        IFD_ENTRIES + 1
-    } else {
-        IFD_ENTRIES
-    };
 
-    let mut buf = Vec::with_capacity(ifd_total(n_tiles, samples));
-    push_u16(&mut buf, entries as u16);
+    let mut buf = Vec::with_capacity(layout.total());
+    push_u16(&mut buf, layout.entries() as u16);
+    // NewSubfileType: reduced-resolution, the bit that makes readers treat
+    // these ifds as a pyramid instead of separate pages
+    if layout.overview {
+        push_entry(&mut buf, 254, 4, 1, 1);
+    }
     push_entry(&mut buf, 256, 3, 1, args.width);
     push_entry(&mut buf, 257, 3, 1, args.height);
     let bits_value = if samples > 2 { bits_off } else { packed(64) };
@@ -458,11 +563,30 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
             arrays_off + n_tiles as u32 * 4,
         );
     }
+    if samples > 1 {
+        let value = if layout.extra_sample_bytes() > 0 {
+            extra_off
+        } else {
+            0
+        };
+        push_entry(&mut buf, 338, 3, layout.extra_samples() as u32, value);
+    }
     let format_value = if samples > 2 { formats_off } else { packed(3) };
     push_entry(&mut buf, 339, 3, samples as u32, format_value);
     push_entry(&mut buf, 33550, 12, 3, scale_off);
     push_entry(&mut buf, 33922, 12, 6, tiepoint_off);
-    push_entry(&mut buf, 34735, 3, 8, geokeys_off);
+    push_entry(&mut buf, 34735, 3, GEO_KEY_SHORTS as u32, geokeys_off);
+    if let Some(text) = &layout.nodata {
+        let count = text.len() as u32 + 1;
+        let value = if layout.nodata_bytes() == 0 {
+            let mut inline = [0u8; INLINE_BYTES];
+            inline[..text.len()].copy_from_slice(text.as_bytes());
+            u32::from_le_bytes(inline)
+        } else {
+            nodata_off
+        };
+        push_entry(&mut buf, 42113, 2, count, value);
+    }
     push_u32(&mut buf, args.next_ifd_offset);
 
     buf.extend_from_slice(&args.pixel_width.to_le_bytes());
@@ -480,10 +604,28 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
 
-    // GeoKeyDirectory: header + one key naming the crs
+    // GeoKeyDirectory: header, then keys sorted by id
     let geographic = (4000..=4999).contains(&args.params.epsg);
-    let key_id: u16 = if geographic { 2048 } else { 3072 };
-    for v in [1u16, 1, 0, 1, key_id, 0, 1, args.params.epsg] {
+    let model_type: u16 = if geographic { 2 } else { 1 };
+    let crs_key: u16 = if geographic { 2048 } else { 3072 };
+    for v in [
+        1u16,
+        1,
+        0,
+        3,
+        1024,
+        0,
+        1,
+        model_type,
+        1025,
+        0,
+        1,
+        1,
+        crs_key,
+        0,
+        1,
+        args.params.epsg,
+    ] {
         push_u16(&mut buf, v);
     }
 
@@ -494,6 +636,18 @@ fn build_ifd(args: &IfdArgs<'_>) -> Vec<u8> {
         for _ in 0..samples {
             push_u16(&mut buf, 3);
         }
+    }
+
+    if layout.extra_sample_bytes() > 0 {
+        for _ in 0..layout.extra_samples() {
+            push_u16(&mut buf, 0);
+        }
+    }
+
+    if layout.nodata_bytes() > 0 {
+        let text = layout.nodata.as_ref().expect("nodata bytes imply a value");
+        buf.extend_from_slice(text.as_bytes());
+        buf.push(0);
     }
 
     if n_tiles > 1 {
@@ -1241,6 +1395,7 @@ mod tests {
             pixel_width: 0.1,
             pixel_height: 0.1,
             deflate: false,
+            ..CogParams::default()
         };
 
         let mut buf = io::Cursor::new(Vec::new());
@@ -1268,6 +1423,7 @@ mod tests {
             pixel_width: 10.0,
             pixel_height: 10.0,
             deflate: false,
+            ..CogParams::default()
         };
 
         let mut buf = io::Cursor::new(Vec::new());
@@ -1301,6 +1457,7 @@ mod tests {
             pixel_width: 0.5,
             pixel_height: 0.5,
             deflate: false,
+            ..CogParams::default()
         };
         let mut buf = io::Cursor::new(Vec::new());
         write_cog(&raster, &params, &mut buf).unwrap();
@@ -1635,6 +1792,7 @@ mod tests {
             pixel_width: 0.5,
             pixel_height: 0.5,
             deflate,
+            ..CogParams::default()
         }
     }
 
@@ -1853,5 +2011,343 @@ mod tests {
         let tiff = build_banded_tiff(16, 16, &[64; 2], &[3; 2], 2, &raw);
         let err = open_err(&tiff);
         assert!(err.contains("PlanarConfiguration"), "{err}");
+    }
+
+    // --- cloud optimized layout ---
+    //
+    // these assert the structure that separates a cog from a merely tiled
+    // tiff, the parts a reader relies on to fetch one zoom level without
+    // pulling the whole file
+
+    /// one ifd: its own offset and its entries as (tag, type, count, value)
+    struct Ifd {
+        offset: u32,
+        entries: Vec<(u16, u16, u32, u32)>,
+    }
+
+    impl Ifd {
+        fn entry(&self, tag: u16) -> Option<(u16, u32, u32)> {
+            self.entries
+                .iter()
+                .find(|e| e.0 == tag)
+                .map(|&(_, ty, count, value)| (ty, count, value))
+        }
+
+        fn value(&self, tag: u16) -> Option<u32> {
+            self.entry(tag).map(|(_, _, value)| value)
+        }
+
+        /// tile offsets, inline for a single tile and out of line otherwise
+        fn tile_offsets(&self, data: &[u8]) -> Vec<u32> {
+            let (_, count, value) = self.entry(324).expect("TileOffsets");
+            if count == 1 {
+                return vec![value];
+            }
+            (0..count as usize)
+                .map(|i| u32_at(data, value as usize + i * 4))
+                .collect()
+        }
+    }
+
+    fn u16_at(data: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(data[at..at + 2].try_into().unwrap())
+    }
+
+    fn u32_at(data: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
+    }
+
+    fn f64_at(data: &[u8], at: usize) -> f64 {
+        f64::from_le_bytes(data[at..at + 8].try_into().unwrap())
+    }
+
+    /// walk the next-ifd chain from the header
+    fn ifd_chain(data: &[u8]) -> Vec<Ifd> {
+        let mut chain = Vec::new();
+        let mut next = u32_at(data, 4);
+        while next != 0 {
+            let at = next as usize;
+            let count = u16_at(data, at) as usize;
+            let entries = (0..count)
+                .map(|i| {
+                    let e = at + 2 + i * 12;
+                    (
+                        u16_at(data, e),
+                        u16_at(data, e + 2),
+                        u32_at(data, e + 4),
+                        u32_at(data, e + 8),
+                    )
+                })
+                .collect();
+            chain.push(Ifd {
+                offset: next,
+                entries,
+            });
+            next = u32_at(data, at + 2 + count * 12);
+        }
+        chain
+    }
+
+    /// the ascii text of a GDAL_NODATA entry, inline or out of line
+    fn nodata_text_of(data: &[u8], ifd: &Ifd) -> Option<String> {
+        let (ty, count, value) = ifd.entry(42113)?;
+        assert_eq!(ty, 2, "GDAL_NODATA is ascii");
+        let bytes = if count as usize <= INLINE_BYTES {
+            value.to_le_bytes()[..count as usize].to_vec()
+        } else {
+            data[value as usize..value as usize + count as usize].to_vec()
+        };
+        assert_eq!(bytes.last(), Some(&0), "ascii values are nul terminated");
+        Some(String::from_utf8(bytes[..bytes.len() - 1].to_vec()).unwrap())
+    }
+
+    #[test]
+    fn only_overview_ifds_are_marked_reduced_resolution() {
+        let (_, bytes) = write_test_cog(100, 80, 3, 4326);
+        let chain = ifd_chain(&bytes);
+        assert_eq!(chain.len(), 4, "full resolution plus three overviews");
+
+        assert_eq!(
+            chain[0].entry(254),
+            None,
+            "the full resolution ifd is not a reduced-resolution image"
+        );
+        for (i, ifd) in chain[1..].iter().enumerate() {
+            let (ty, count, value) = ifd
+                .entry(254)
+                .unwrap_or_else(|| panic!("overview {i} needs NewSubfileType"));
+            assert_eq!((ty, count, value), (4, 1, 1), "overview {i}");
+        }
+    }
+
+    #[test]
+    fn ifds_precede_all_tile_data_and_ascend() {
+        let (_, bytes) = write_test_cog(100, 80, 3, 4326);
+        let chain = ifd_chain(&bytes);
+
+        assert_eq!(chain[0].offset, 8, "the main ifd follows the header");
+        for pair in chain.windows(2) {
+            assert!(
+                pair[1].offset > pair[0].offset,
+                "ifds ascend: {} then {}",
+                pair[0].offset,
+                pair[1].offset
+            );
+        }
+
+        let last_ifd = chain.last().unwrap().offset;
+        let first_tile = chain
+            .iter()
+            .flat_map(|ifd| ifd.tile_offsets(&bytes))
+            .min()
+            .unwrap();
+        assert!(
+            first_tile > last_ifd,
+            "tile data at {first_tile} must follow the last ifd at {last_ifd}"
+        );
+    }
+
+    #[test]
+    fn tile_data_runs_smallest_overview_first() {
+        let (_, bytes) = write_test_cog(100, 80, 3, 4326);
+        let chain = ifd_chain(&bytes);
+        let starts: Vec<u32> = chain
+            .iter()
+            .map(|ifd| *ifd.tile_offsets(&bytes).iter().min().unwrap())
+            .collect();
+
+        // level 0 is full resolution and the last level is the smallest
+        // overview, so the offsets descend as resolution rises
+        for level in 0..starts.len() - 1 {
+            assert!(
+                starts[level] > starts[level + 1],
+                "level {level} data at {} should follow level {} at {}",
+                starts[level],
+                level + 1,
+                starts[level + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn tiles_are_row_major_and_cover_each_level() {
+        let (_, bytes) = write_test_cog(100, 80, 2, 4326);
+        let chain = ifd_chain(&bytes);
+        let sizes = [(100u32, 80u32), (50, 40), (25, 20)];
+
+        for (ifd, (width, height)) in chain.iter().zip(sizes) {
+            assert_eq!(ifd.value(256), Some(width));
+            assert_eq!(ifd.value(257), Some(height));
+            assert_eq!(ifd.value(322), Some(16), "TileWidth");
+            assert_eq!(ifd.value(323), Some(16), "TileLength");
+
+            let expected = width.div_ceil(16) * height.div_ceil(16);
+            let offsets = ifd.tile_offsets(&bytes);
+            assert_eq!(
+                offsets.len() as u32,
+                expected,
+                "tile count for {width}x{height}"
+            );
+            for pair in offsets.windows(2) {
+                assert!(pair[1] > pair[0], "tiles ascend in row-major order");
+            }
+        }
+    }
+
+    #[test]
+    fn geo_tags_land_on_every_level() {
+        let (_, bytes) = write_test_cog(100, 80, 2, 32632);
+        let chain = ifd_chain(&bytes);
+
+        for (level, ifd) in chain.iter().enumerate() {
+            let scale = ifd.value(33550).expect("ModelPixelScale") as usize;
+            let tiepoint = ifd.value(33922).expect("ModelTiepoint") as usize;
+            let keys = ifd.value(34735).expect("GeoKeyDirectory") as usize;
+
+            // each overview halves resolution, so its pixels are wider
+            let factor = 2f64.powi(level as i32);
+            assert_eq!(f64_at(&bytes, scale), 0.5 * factor, "level {level} x scale");
+            assert_eq!(
+                f64_at(&bytes, scale + 8),
+                0.5 * factor,
+                "level {level} y scale"
+            );
+
+            // the tiepoint ties raster (0,0) to the map origin
+            assert_eq!(f64_at(&bytes, tiepoint + 24), 10.0);
+            assert_eq!(f64_at(&bytes, tiepoint + 32), 50.0);
+
+            assert_eq!(u16_at(&bytes, keys + 6), 3, "three geo keys");
+            // projected model type, pixel-is-area, then the crs
+            assert_eq!(u16_at(&bytes, keys + 8), 1024);
+            assert_eq!(u16_at(&bytes, keys + 14), 1);
+            assert_eq!(u16_at(&bytes, keys + 16), 1025);
+            assert_eq!(u16_at(&bytes, keys + 22), 1);
+            assert_eq!(u16_at(&bytes, keys + 24), 3072);
+            assert_eq!(u16_at(&bytes, keys + 30), 32632);
+        }
+    }
+
+    #[test]
+    fn geographic_crs_uses_the_geographic_geo_keys() {
+        let (_, bytes) = write_test_cog(20, 20, 0, 4326);
+        let keys = ifd_chain(&bytes)[0].value(34735).unwrap() as usize;
+        assert_eq!(u16_at(&bytes, keys + 14), 2, "geographic model type");
+        assert_eq!(u16_at(&bytes, keys + 24), 2048, "GeographicTypeGeoKey");
+        assert_eq!(u16_at(&bytes, keys + 30), 4326);
+    }
+
+    fn write_cog_with(raster: &Raster, nodata: Option<f64>) -> Vec<u8> {
+        let params = CogParams {
+            tile_width: 16,
+            tile_height: 16,
+            overview_levels: 1,
+            epsg: 4326,
+            nodata,
+            ..CogParams::default()
+        };
+        let mut buf = io::Cursor::new(Vec::new());
+        write_cog(raster, &params, &mut buf).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn nodata_is_declared_on_every_level() {
+        let raster = test_raster(40, 40);
+        let bytes = write_cog_with(&raster, Some(-9999.0));
+        for (level, ifd) in ifd_chain(&bytes).iter().enumerate() {
+            assert_eq!(
+                nodata_text_of(&bytes, ifd).as_deref(),
+                Some("-9999"),
+                "level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn nan_nodata_is_spelled_the_way_gdal_spells_it() {
+        let raster = test_raster(20, 20);
+        let bytes = write_cog_with(&raster, Some(f64::NAN));
+        let chain = ifd_chain(&bytes);
+        assert_eq!(nodata_text_of(&bytes, &chain[0]).as_deref(), Some("nan"));
+    }
+
+    #[test]
+    fn no_nodata_tag_when_none_is_asked_for() {
+        let raster = test_raster(20, 20);
+        let bytes = write_cog_with(&raster, None);
+        assert_eq!(ifd_chain(&bytes)[0].entry(42113), None);
+    }
+
+    #[test]
+    fn nan_samples_become_the_declared_nodata_and_read_back_as_nan() {
+        let mut raster = test_raster(40, 40);
+        raster.set(3, 5, f64::NAN);
+        raster.set(20, 21, f64::NAN);
+        let bytes = write_cog_with(&raster, Some(-9999.0));
+
+        // the file stores the declared value, not NaN
+        let ifd = &ifd_chain(&bytes)[0];
+        let tile = ifd.tile_offsets(&bytes)[0] as usize;
+        assert_eq!(f64_at(&bytes, tile + (3 * 16 + 5) * 8), -9999.0);
+
+        // and terrano's reader maps it back to NaN
+        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let window = reader.read_window(0, 0, 0, 40, 40).unwrap();
+        assert!(window.get(3, 5).unwrap().is_nan());
+        assert!(window.get(20, 21).unwrap().is_nan());
+        assert_eq!(window.get(0, 1).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn multi_band_declares_its_extra_samples() {
+        let bands = BandedRaster::new(vec![
+            test_raster(40, 40),
+            test_raster(40, 40),
+            test_raster(40, 40),
+        ])
+        .unwrap();
+        let bytes = write_test_cog_bands(&bands, false);
+        let ifd = &ifd_chain(&bytes)[0];
+
+        assert_eq!(ifd.value(277), Some(3), "SamplesPerPixel");
+        // libtiff wants colour channels plus extra samples to reach
+        // SamplesPerPixel, and min-is-black contributes one
+        let (ty, count, value) = ifd.entry(338).expect("ExtraSamples");
+        assert_eq!((ty, count), (3, 2));
+        assert_eq!(value, 0, "both extra bands are unspecified data");
+    }
+
+    #[test]
+    fn deflate_tiles_are_smaller_and_still_read_back() {
+        let raster = test_raster(64, 64);
+        let plain = write_cog_with(&raster, Some(-9999.0));
+        let params = CogParams {
+            tile_width: 16,
+            tile_height: 16,
+            overview_levels: 1,
+            epsg: 4326,
+            deflate: true,
+            nodata: Some(-9999.0),
+            ..CogParams::default()
+        };
+        let mut buf = io::Cursor::new(Vec::new());
+        write_cog(&raster, &params, &mut buf).unwrap();
+        let squeezed = buf.into_inner();
+
+        assert_eq!(ifd_chain(&plain)[0].value(259), Some(1), "no compression");
+        assert_eq!(ifd_chain(&squeezed)[0].value(259), Some(8), "deflate");
+        assert!(
+            squeezed.len() < plain.len(),
+            "deflate should shrink a smooth ramp: {} vs {}",
+            squeezed.len(),
+            plain.len()
+        );
+
+        let mut reader = CogReader::open(squeezed.as_slice()).unwrap();
+        let window = reader.read_window(0, 0, 0, 64, 64).unwrap();
+        for i in 0..64 * 64 {
+            assert_eq!(window.data()[i], raster.data()[i]);
+        }
     }
 }

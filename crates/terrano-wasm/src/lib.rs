@@ -8,7 +8,7 @@
 //! Polygons nest one level deeper: [value, ring_count, (vertex_count, x0, y0,
 //! ...) per ring], exterior ring first.
 
-use terrano_core::{BinaryOp, FocalStat, Neighborhood, Raster, RegionPolygon, UnaryOp};
+use terrano_core::{BinaryOp, CogParams, FocalStat, Neighborhood, Raster, RegionPolygon, UnaryOp};
 use wasm_bindgen::prelude::*;
 
 /// Read the polygon encoding this module also emits from `polygonize`.
@@ -336,6 +336,44 @@ pub fn rasterize(
     .into_data())
 }
 
+/// Encode a raster as a Cloud Optimized GeoTIFF, returning the file bytes.
+///
+/// `overview_levels` of 0 writes no pyramid. Samples are 64-bit float, so a
+/// browser handing back an 8-bit image gets a file eight times its size.
+#[expect(clippy::too_many_arguments)]
+#[wasm_bindgen(js_name = writeCog)]
+pub fn write_cog(
+    data: &[f64],
+    width: usize,
+    height: usize,
+    nodata: f64,
+    epsg: u16,
+    origin_x: f64,
+    origin_y: f64,
+    pixel_width: f64,
+    pixel_height: f64,
+    tile_size: u32,
+    overview_levels: u32,
+    deflate: bool,
+) -> Result<Vec<u8>, JsError> {
+    let src = raster(data, width, height, pixel_width, nodata)?;
+    let params = CogParams {
+        tile_width: tile_size,
+        tile_height: tile_size,
+        overview_levels,
+        epsg,
+        origin_x,
+        origin_y,
+        pixel_width,
+        pixel_height,
+        deflate,
+        nodata: Some(nodata),
+    };
+    let mut out = Vec::new();
+    terrano_core::write_cog(&src, &params, &mut out).map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(out)
+}
+
 // happy paths only: constructing a JsError aborts off wasm, so the error arms
 // are exercised by the browser tests in the consuming viewer instead
 #[cfg(test)]
@@ -491,6 +529,31 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn write_cog_emits_a_pyramid_the_reader_can_open() {
+        let (width, height) = (40usize, 30usize);
+        let mut data: Vec<f64> = (0..width * height).map(|i| i as f64).collect();
+        data[7] = f64::NAN;
+
+        let bytes = write_cog(
+            &data, width, height, -9999.0, 4326, 10.0, 50.0, 0.5, 0.5, 16, 2, true,
+        )
+        .unwrap();
+
+        let mut reader = terrano_core::CogReader::open(bytes.as_slice()).unwrap();
+        assert_eq!(
+            reader.levels().len(),
+            3,
+            "full resolution plus two overviews"
+        );
+        assert_eq!(reader.meta().epsg, 4326);
+        assert_eq!(reader.meta().origin_x, 10.0);
+
+        let window = reader.read_window(0, 0, 0, width, height).unwrap();
+        assert_eq!(window.get(0, 1).unwrap(), 1.0);
+        assert!(window.get(0, 7).unwrap().is_nan(), "nodata survives");
     }
 
     #[test]

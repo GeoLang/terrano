@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `writeCog` in `terrano-wasm` (2026-08-13): COG encoding from the browser,
+  taking a flat f64 buffer plus georeferencing and returning the file bytes.
+  terrano-core builds for wasm32-unknown-unknown with no C dependencies,
+  flate2 resolving to pure-Rust miniz_oxide, so deflate works there too.
+
 - `focal_stats`, `zonal_stats` and `rasterize` (2026-08-04): the neighbourhood
   and grouped summaries, plus the polygon burn that feeds them.
   `focal_stats(raster, radius, shape, stat)` reports min/max/mean/sum/std/
@@ -44,6 +49,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `write_cog` output is now a real cloud optimized GeoTIFF (2026-08-13), not
+  just a tiled one. Overview IFDs carry NewSubfileType, without which GDAL
+  read the pyramid as four unrelated pages and reported no overviews at all,
+  and tile data is now laid out smallest overview first with full resolution
+  last, the order the COG spec requires so a zoomed-out reader can stop early.
+  Files pass `validate_cloud_optimized_geotiff.py --full-check` against GDAL
+  3.11, single and multi-band, raw and deflate.
+- `write_cog` writes GDAL_NODATA, set through the new `CogParams.nodata`, and
+  substitutes it for NaN samples so the value the file declares absent is the
+  one actually stored. Defaults to `nan`, which is what the writer already
+  padded partial edge tiles with. The reader has always mapped the declared
+  nodata back to NaN.
+- `write_cog` GeoKeyDirectory gained GTModelTypeGeoKey and GTRasterTypeGeoKey
+  alongside the CRS key, and multi-band output declares ExtraSamples, which
+  silences a libtiff warning on every read of a multi-band terrano COG.
+- `write_cog` and `write_cog_bands` no longer require `Seek`, so a browser can
+  write straight into a `Vec<u8>`. Oversized images now error instead of
+  silently truncating their 32-bit offsets.
 - `aspect` (2026-08-06) now delivers its documented compass convention:
   degrees clockwise from north, where it previously returned the raw
   counterclockwise-from-east atan2 angle. Flat cells (zero gradient) keep
