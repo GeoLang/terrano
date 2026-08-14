@@ -9,7 +9,8 @@
 //! ...) per ring], exterior ring first.
 
 use terrano_core::{
-    BinaryOp, CogParams, FocalStat, Neighborhood, Raster, RegionPolygon, SampleFormat, UnaryOp,
+    BandedRaster, BinaryOp, CogParams, FocalStat, Neighborhood, Raster, RegionPolygon,
+    SampleFormat, UnaryOp,
 };
 use wasm_bindgen::prelude::*;
 
@@ -362,6 +363,48 @@ pub fn write_cog(
     deflate: bool,
     sample_format: &str,
 ) -> Result<Vec<u8>, JsError> {
+    write_cog_bands(
+        data,
+        1,
+        width,
+        height,
+        nodata,
+        epsg,
+        origin_x,
+        origin_y,
+        pixel_width,
+        pixel_height,
+        tile_size,
+        overview_levels,
+        deflate,
+        sample_format,
+    )
+}
+
+/// Encode a multi-band raster as a pixel-interleaved COG, returning the file
+/// bytes.
+///
+/// `data` holds the bands end to end, each `width * height` long, so band `b`
+/// starts at `b * width * height`. Every other argument means what it does in
+/// `writeCog`, which is this function at one band.
+#[expect(clippy::too_many_arguments)]
+#[wasm_bindgen(js_name = writeCogBands)]
+pub fn write_cog_bands(
+    data: &[f64],
+    band_count: usize,
+    width: usize,
+    height: usize,
+    nodata: f64,
+    epsg: u16,
+    origin_x: f64,
+    origin_y: f64,
+    pixel_width: f64,
+    pixel_height: f64,
+    tile_size: u32,
+    overview_levels: u32,
+    deflate: bool,
+    sample_format: &str,
+) -> Result<Vec<u8>, JsError> {
     let format = SampleFormat::from_name(sample_format).ok_or_else(|| {
         let names: Vec<&str> = SampleFormat::ALL.iter().map(|f| f.name()).collect();
         JsError::new(&format!(
@@ -369,7 +412,20 @@ pub fn write_cog(
             names.join(", ")
         ))
     })?;
-    let src = raster(data, width, height, pixel_width, nodata)?;
+    if band_count == 0 {
+        return Err(JsError::new("a cog needs at least one band"));
+    }
+    if data.len() != band_count * width * height {
+        return Err(JsError::new(&format!(
+            "{} samples for {band_count} bands of {width}x{height}",
+            data.len()
+        )));
+    }
+    let bands = data
+        .chunks(width * height)
+        .map(|band| raster(band, width, height, pixel_width, nodata))
+        .collect::<Result<Vec<Raster>, JsError>>()?;
+    let bands = BandedRaster::new(bands).map_err(|e| JsError::new(&e.to_string()))?;
     let params = CogParams {
         tile_width: tile_size,
         tile_height: tile_size,
@@ -384,7 +440,8 @@ pub fn write_cog(
         format,
     };
     let mut out = Vec::new();
-    terrano_core::write_cog(&src, &params, &mut out).map_err(|e| JsError::new(&e.to_string()))?;
+    terrano_core::write_cog_bands(&bands, &params, &mut out)
+        .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(out)
 }
 
@@ -593,6 +650,30 @@ mod tests {
         let window = reader.read_window(0, 0, 0, width, height).unwrap();
         for (got, want) in window.data().iter().zip(&data) {
             assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn write_cog_bands_reads_back_band_by_band() {
+        let (width, height) = (32usize, 24usize);
+        let cells = width * height;
+        let data: Vec<f64> = (0..cells * 3)
+            .map(|i| (i / cells) as f64 * 1000.0 + (i % cells) as f64)
+            .collect();
+
+        let bytes = write_cog_bands(
+            &data, 3, width, height, 65535.0, 4326, 10.0, 50.0, 0.5, 0.5, 16, 1, true, "u16",
+        )
+        .unwrap();
+
+        let mut reader = terrano_core::CogReader::open(bytes.as_slice()).unwrap();
+        let window = reader.read_window_bands(0, 0, 0, width, height).unwrap();
+        assert_eq!(window.band_count(), 3);
+        for band in 0..3 {
+            assert_eq!(
+                window.band(band).unwrap().data(),
+                &data[band * cells..(band + 1) * cells]
+            );
         }
     }
 

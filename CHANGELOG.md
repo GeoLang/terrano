@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `writeCogBands` in `terrano-wasm` (2026-08-13): multi-band COG encoding from
+  the browser, over one flat f64 buffer holding the bands end to end plus a
+  band count, so band `b` starts at `b * width * height`. It fronts
+  terrano-core's `write_cog_bands`, writing pixel-interleaved tiles with
+  SamplesPerPixel set and overviews block-averaged per band. `writeCog` is now
+  this function at one band, so both take the same georeferencing, sample
+  format and nodata.
+
 - COG sample formats (2026-08-13): `CogParams::format` writes u8, i8, u16,
   i16, u32, i32, f32 or f64 tiles, matching what the reader already decoded.
   It defaults to f64, so existing callers are unchanged, and an 8-bit image
