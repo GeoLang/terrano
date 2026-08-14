@@ -8,7 +8,8 @@
 //! tiles, horizontal and floating-point predictors, integer and float
 //! sample types (decoded to f64, nodata mapped to NaN). The writer covers
 //! the same sample types through [`CogParams::format`], raw or deflate, and
-//! its output passes GDAL's `validate_cloud_optimized_geotiff.py`.
+//! its output passes GDAL's `validate_cloud_optimized_geotiff.py`, which CI
+//! runs on every push via the `validation_cog` example.
 //!
 //! Multi-band files are pixel-interleaved (PlanarConfiguration 1) and go
 //! through [`write_cog_bands`] and [`CogReader::read_window_bands`]. The

@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- COG validation in CI (2026-08-14): a `cog-validate` job writes a single-band
+  f32 and a multi-band u8 COG through the `validation_cog` example, runs GDAL's
+  `validate_cloud_optimized_geotiff.py --full-check` on both, and asserts the
+  overviews via gdalinfo, since the validator only warns when a tiled file has
+  none. The README's validation claim was one manual run until now.
+
 - `writeCogBands` in `terrano-wasm` (2026-08-13): multi-band COG encoding from
   the browser, over one flat f64 buffer holding the bands end to end plus a
   band count, so band `b` starts at `b * width * height`. It fronts

@@ -29,6 +29,28 @@ jobs:
       - name: Test
         run: cargo test --all
 
+  cog-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GDAL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gdal gdal-bin
+      - name: Write COGs
+        run: cargo run -p terrano-core --example validation_cog -- cog-out
+      - name: Validate with GDAL
+        run: |
+          python3 -m osgeo_utils.samples.validate_cloud_optimized_geotiff --full-check=yes cog-out/single.tif
+          python3 -m osgeo_utils.samples.validate_cloud_optimized_geotiff --full-check=yes cog-out/rgb.tif
+      - name: Overviews present
+        # the validator only warns when a tiled file has no overviews, so name them
+        run: |
+          gdalinfo cog-out/single.tif | grep Overviews
+          gdalinfo cog-out/rgb.tif | grep Overviews
+
   deny:
     runs-on: ubuntu-latest
     steps:
