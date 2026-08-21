@@ -32,6 +32,8 @@ pub struct Variable {
     pub dimensions: Vec<String>,
     pub attributes: HashMap<String, AttributeValue>,
     pub shape: Vec<usize>,
+    /// Byte offset of this variable's data from the start of the file (`begin`).
+    pub begin: u64,
 }
 
 /// NetCDF data types.
@@ -80,7 +82,7 @@ pub fn read_netcdf_metadata<R: Read + Seek>(
         return Err(Error::Format("not a valid NetCDF classic file".to_string()));
     }
 
-    let _version = magic[3];
+    let version = magic[3];
 
     // Read number of records
     let num_recs = read_u32(reader)?;
@@ -93,7 +95,7 @@ pub fn read_netcdf_metadata<R: Read + Seek>(
     let global_attributes = read_att_list(reader)?;
 
     // Read variables
-    let variables = read_var_list(reader, &dimensions)?;
+    let variables = read_var_list(reader, &dimensions, version)?;
 
     Ok(NetCdfMetadata {
         dimensions,
@@ -142,9 +144,7 @@ pub fn read_netcdf_variable<R: Read + Seek>(
         0
     };
 
-    // We need the variable's data offset — stored externally in a real impl.
-    // For now, we read from current position + slice offset.
-    reader.seek(SeekFrom::Current(slice_offset as i64))?;
+    reader.seek(SeekFrom::Start(var.begin + slice_offset as u64))?;
 
     let mut raw = vec![0u8; total_2d * byte_size];
     reader.read_exact(&mut raw)?;
@@ -187,6 +187,12 @@ fn read_u32<R: Read>(reader: &mut R) -> Result<u32, Error> {
     Ok(u32::from_be_bytes(buf))
 }
 
+fn read_u64<R: Read>(reader: &mut R) -> Result<u64, Error> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(u64::from_be_bytes(buf))
+}
+
 fn read_dim_list<R: Read>(reader: &mut R) -> Result<Vec<Dimension>, Error> {
     let tag = read_u32(reader)?;
     let count = read_u32(reader)?;
@@ -224,7 +230,11 @@ fn read_att_list<R: Read>(reader: &mut R) -> Result<HashMap<String, AttributeVal
     Ok(attrs)
 }
 
-fn read_var_list<R: Read>(reader: &mut R, dims: &[Dimension]) -> Result<Vec<Variable>, Error> {
+fn read_var_list<R: Read>(
+    reader: &mut R,
+    dims: &[Dimension],
+    version: u8,
+) -> Result<Vec<Variable>, Error> {
     let tag = read_u32(reader)?;
     let count = read_u32(reader)?;
     if tag == 0 && count == 0 {
@@ -246,7 +256,11 @@ fn read_var_list<R: Read>(reader: &mut R, dims: &[Dimension]) -> Result<Vec<Vari
         let attributes = read_att_list(reader)?;
         let nc_type = read_u32(reader)?;
         let _vsize = read_u32(reader)?;
-        let _offset = read_u32(reader)?;
+        let begin = if version == 2 {
+            read_u64(reader)?
+        } else {
+            u64::from(read_u32(reader)?)
+        };
         let data_type = match nc_type {
             1 => DataType::Byte,
             2 => DataType::Char,
@@ -262,6 +276,7 @@ fn read_var_list<R: Read>(reader: &mut R, dims: &[Dimension]) -> Result<Vec<Vari
             dimensions: dim_names,
             attributes,
             shape,
+            begin,
         });
     }
     Ok(vars)
@@ -371,6 +386,7 @@ fn infer_cell_size(metadata: &NetCdfMetadata, var: &Variable) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufReader, Cursor};
 
     #[test]
     fn test_data_type_sizes() {
@@ -395,5 +411,82 @@ mod tests {
         assert_eq!(get_attr_f64(&attrs, "scale_factor"), Some(0.01));
         assert!((get_attr_f64(&attrs, "add_offset").unwrap() - 273.15).abs() < 0.01);
         assert_eq!(get_attr_f64(&attrs, "missing"), None);
+    }
+
+    fn put_name(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+        let pad = (4 - (s.len() % 4)) % 4;
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
+
+    fn classic_two_var_netcdf() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x01");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&10u32.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        put_name(&mut buf, "y");
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        put_name(&mut buf, "x");
+        buf.extend_from_slice(&2u32.to_be_bytes());
+
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&11u32.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes());
+
+        put_name(&mut buf, "temp");
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&5u32.to_be_bytes());
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        let temp_begin_at = buf.len();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        put_name(&mut buf, "precip");
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&5u32.to_be_bytes());
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        let precip_begin_at = buf.len();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        let temp_begin = buf.len() as u32;
+        for v in [1.0f32, 2.0, 3.0, 4.0] {
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        let precip_begin = buf.len() as u32;
+        for v in [10.0f32, 20.0, 30.0, 40.0] {
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        buf[temp_begin_at..temp_begin_at + 4].copy_from_slice(&temp_begin.to_be_bytes());
+        buf[precip_begin_at..precip_begin_at + 4].copy_from_slice(&precip_begin.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_read_second_variable_uses_begin_offset() {
+        let bytes = classic_two_var_netcdf();
+        let mut reader = BufReader::new(Cursor::new(bytes));
+        let meta = read_netcdf_metadata(&mut reader).unwrap();
+        assert_eq!(meta.variables.len(), 2);
+        assert!(meta.variables[1].begin > meta.variables[0].begin);
+
+        let precip = read_netcdf_variable(&mut reader, &meta, "precip").unwrap();
+        assert_eq!(precip.width(), 2);
+        assert_eq!(precip.height(), 2);
+        assert!((precip.get(0, 0).unwrap() - 10.0).abs() < 1e-5);
+        assert!((precip.get(0, 1).unwrap() - 20.0).abs() < 1e-5);
+        assert!((precip.get(1, 0).unwrap() - 30.0).abs() < 1e-5);
+        assert!((precip.get(1, 1).unwrap() - 40.0).abs() < 1e-5);
     }
 }

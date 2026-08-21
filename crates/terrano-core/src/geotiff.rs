@@ -360,9 +360,10 @@ pub fn write_geotiff_bands<W: Write>(
 
 /// Read a multi-band GeoTIFF written by [`write_geotiff_bands`].
 ///
-/// Supports uncompressed, single-strip, pixel-interleaved files in any
-/// [`SampleFormat`]. A single-band file reads back as a one-band raster; band
-/// names are not carried by the file, so bands come back unnamed.
+/// Supports uncompressed, pixel-interleaved files in any [`SampleFormat`].
+/// Strips are concatenated using RowsPerStrip and StripOffsets. A single-band
+/// file reads back as a one-band raster; band names are not carried by the
+/// file, so bands come back unnamed.
 pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata), Error> {
     let ifd_offset = first_ifd_offset(data)?;
     let num_entries = read_u16_at(data, ifd_offset) as usize;
@@ -374,7 +375,9 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
     let mut height = 0u32;
     let mut samples = 1u32;
     let mut planar = 1u16;
-    let mut strip_offset = 0u32;
+    let mut compression = 0u16;
+    let mut rows_per_strip = 0u32;
+    let mut strip_offsets: Vec<u32> = Vec::new();
     let mut bits_per_sample: Vec<u16> = Vec::new();
     let mut sample_formats: Vec<u16> = Vec::new();
     let mut tiepoint_offset = 0u32;
@@ -392,8 +395,10 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
             256 => width = value,
             257 => height = value,
             258 => bits_per_sample = read_shorts(data, entry_off)?,
-            273 => strip_offset = value,
+            259 => compression = (value & 0xffff) as u16,
+            273 => strip_offsets = read_offset_array(data, entry_off)?,
             277 => samples = value,
+            278 => rows_per_strip = value,
             284 => planar = value as u16,
             339 => sample_formats = read_shorts(data, entry_off)?,
             33550 => pixel_scale_offset = value,
@@ -412,6 +417,11 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
     if samples == 0 {
         return Err(Error::Format("SamplesPerPixel is 0".into()));
     }
+    if compression != 1 {
+        return Err(Error::Format(
+            "only uncompressed (Compression=1) GeoTIFF is supported".into(),
+        ));
+    }
     if planar != 1 {
         return Err(Error::Format(
             "only pixel-interleaved (PlanarConfiguration 1) files supported".into(),
@@ -419,6 +429,9 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
     }
     if pixel_scale_offset == 0 || tiepoint_offset == 0 {
         return Err(Error::Format("missing georeferencing tags".into()));
+    }
+    if strip_offsets.is_empty() {
+        return Err(Error::Format("missing StripOffsets".into()));
     }
 
     // BitsPerSample and SampleFormat may be absent (defaults 1 and unsigned int)
@@ -435,11 +448,39 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
         )));
     };
 
+    let rows_per_strip = if rows_per_strip == 0 || rows_per_strip == u32::MAX {
+        height
+    } else {
+        rows_per_strip
+    };
+    let n_strips = (height as usize).div_ceil(rows_per_strip as usize);
+    if strip_offsets.len() != n_strips {
+        return Err(Error::Format(format!(
+            "expected {n_strips} strips, found {}",
+            strip_offsets.len()
+        )));
+    }
+
     let sample_bytes = format.bytes() as usize;
     let pixels = width as usize * height as usize;
-    let base = strip_offset as usize;
-    if base + pixels * samples as usize * sample_bytes > data.len() {
-        return Err(Error::Format("truncated strip data".into()));
+    let mut band_values: Vec<Vec<f64>> = (0..samples as usize).map(|_| vec![0.0; pixels]).collect();
+
+    for (strip_i, &strip_off) in strip_offsets.iter().enumerate() {
+        let row0 = strip_i * rows_per_strip as usize;
+        let rows = (rows_per_strip as usize).min(height as usize - row0);
+        let strip_pixels = rows * width as usize;
+        let strip_bytes = strip_pixels * samples as usize * sample_bytes;
+        let base = strip_off as usize;
+        if base + strip_bytes > data.len() {
+            return Err(Error::Format("truncated strip data".into()));
+        }
+        for pixel in 0..strip_pixels {
+            let dest = row0 * width as usize + pixel;
+            for (band, values) in band_values.iter_mut().enumerate() {
+                let off = base + (pixel * samples as usize + band) * sample_bytes;
+                values[dest] = format.decode(&data[off..]);
+            }
+        }
     }
 
     let meta = geo_meta_from(
@@ -452,12 +493,7 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
 
     let nodata = -9999.0;
     let mut bands = Vec::with_capacity(samples as usize);
-    for band in 0..samples as usize {
-        let mut values = Vec::with_capacity(pixels);
-        for pixel in 0..pixels {
-            let off = base + (pixel * samples as usize + band) * sample_bytes;
-            values.push(format.decode(&data[off..]));
-        }
+    for values in band_values {
         bands.push(Raster::from_vec(
             width as usize,
             height as usize,
@@ -470,66 +506,17 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
     Ok((BandedRaster::new(bands)?, meta))
 }
 
-/// Read a minimal GeoTIFF file (uncompressed, single band, f64).
+/// Read an uncompressed GeoTIFF as a single-band raster (band 0).
 ///
-/// This is a basic reader supporting the subset written by `write_geotiff`.
+/// Honours BitsPerSample, SampleFormat, Compression and RowsPerStrip for the
+/// same uncompressed, pixel-interleaved files as [`read_geotiff_bands`].
 pub fn read_geotiff(data: &[u8]) -> Result<(Raster, GeoTiffMetadata), Error> {
-    let ifd_offset = first_ifd_offset(data)?;
-
-    let num_entries = read_u16_at(data, ifd_offset) as usize;
-    let mut width = 0u32;
-    let mut height = 0u32;
-    let mut strip_offset = 0u32;
-    let mut tiepoint_offset = 0u32;
-    let mut pixel_scale_offset = 0u32;
-    let mut geo_keys_offset = 0u32;
-    let mut geo_keys_count = 0u32;
-
-    for i in 0..num_entries {
-        let entry_off = ifd_offset + 2 + i * 12;
-        let tag = read_u16_at(data, entry_off);
-        let _typ = read_u16_at(data, entry_off + 2);
-        let count = read_u32_at(data, entry_off + 4);
-        let value = read_u32_at(data, entry_off + 8);
-
-        match tag {
-            256 => width = value,
-            257 => height = value,
-            273 => strip_offset = value,
-            33550 => pixel_scale_offset = value,
-            33922 => tiepoint_offset = value,
-            34735 => {
-                geo_keys_count = count;
-                geo_keys_offset = value;
-            }
-            _ => {}
-        }
-    }
-
-    if width == 0 || height == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing width/height").into());
-    }
-
-    let meta = geo_meta_from(
-        data,
-        pixel_scale_offset,
-        tiepoint_offset,
-        geo_keys_offset,
-        geo_keys_count,
-    );
-
-    // Read raster data
-    let nodata = -9999.0;
-    let mut raster = Raster::new(width as usize, height as usize, meta.pixel_width, nodata);
-    let base = strip_offset as usize;
-    for row in 0..height as usize {
-        for col in 0..width as usize {
-            let off = base + (row * width as usize + col) * 8;
-            let val = read_f64_at(data, off);
-            raster.set(row, col, val);
-        }
-    }
-
+    let (banded, meta) = read_geotiff_bands(data)?;
+    let raster = banded
+        .into_bands()
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Format("GeoTIFF has no bands".into()))?;
     Ok((raster, meta))
 }
 
@@ -656,6 +643,53 @@ fn read_shorts(data: &[u8], entry_off: usize) -> Result<Vec<u16>, Error> {
     Ok((0..count)
         .map(|i| read_u16_at(data, offset + i * 2))
         .collect())
+}
+
+/// Read StripOffsets / StripByteCounts (SHORT or LONG) from an IFD entry.
+fn read_offset_array(data: &[u8], entry_off: usize) -> Result<Vec<u32>, Error> {
+    let typ = read_u16_at(data, entry_off + 2);
+    let count = read_u32_at(data, entry_off + 4) as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let elem_size: usize = match typ {
+        3 => 2,
+        4 => 4,
+        _ => {
+            return Err(Error::Format(format!(
+                "unsupported offset array type {typ}"
+            )));
+        }
+    };
+    let inline_n = 4 / elem_size;
+    if count <= inline_n {
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let at = entry_off + 8 + i * elem_size;
+            let v = if elem_size == 2 {
+                u32::from(read_u16_at(data, at))
+            } else {
+                read_u32_at(data, at)
+            };
+            out.push(v);
+        }
+        return Ok(out);
+    }
+    let offset = read_u32_at(data, entry_off + 8) as usize;
+    if offset + count * elem_size > data.len() {
+        return Err(Error::Format("offset array outside file".into()));
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = offset + i * elem_size;
+        let v = if elem_size == 2 {
+            u32::from(read_u16_at(data, at))
+        } else {
+            read_u32_at(data, at)
+        };
+        out.push(v);
+    }
+    Ok(out)
 }
 
 fn write_u16(buf: &mut Vec<u8>, val: u16) -> Result<(), Error> {
@@ -971,5 +1005,91 @@ mod tests {
         write_geotiff_bands(&raster, &utm_meta(), SampleFormat::U8, &mut buf).unwrap();
         buf.truncate(buf.len() - 4);
         assert!(read_geotiff_bands(&buf).is_err());
+    }
+
+    #[test]
+    fn test_read_geotiff_u16_uncompressed_values_match() {
+        let values = vec![0.0, 1.0, 255.0, 256.0, 1000.0, 65535.0];
+        let raster = BandedRaster::new(vec![band_of(values.clone())]).unwrap();
+        let mut buf = Vec::new();
+        write_geotiff_bands(&raster, &utm_meta(), SampleFormat::U16, &mut buf).unwrap();
+
+        let (read, meta) = read_geotiff(&buf).unwrap();
+        assert_eq!(read.width(), 3);
+        assert_eq!(read.height(), 2);
+        assert_eq!(meta.epsg, 32632);
+        for row in 0..2 {
+            for col in 0..3 {
+                assert_eq!(
+                    read.get(row, col),
+                    Some(values[row * 3 + col]),
+                    "mismatch at ({row},{col})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_geotiff_rejects_compressed() {
+        let raster = Raster::from_vec(2, 2, vec![1.0; 4], 1.0, -9999.0).unwrap();
+        let mut buf = Vec::new();
+        write_geotiff(&raster, &utm_meta(), &mut buf).unwrap();
+        let ifd = read_u32_at(&buf, 4) as usize;
+        let entries = read_u16_at(&buf, ifd) as usize;
+        for i in 0..entries {
+            let off = ifd + 2 + i * 12;
+            if read_u16_at(&buf, off) == 259 {
+                buf[off + 8] = 5;
+                buf[off + 9] = 0;
+                buf[off + 10] = 0;
+                buf[off + 11] = 0;
+            }
+        }
+        assert!(read_geotiff(&buf).is_err());
+    }
+
+    #[test]
+    fn test_read_geotiff_u16_multiple_strips() {
+        let values = vec![0.0, 1.0, 255.0, 256.0, 1000.0, 65535.0];
+        let raster = BandedRaster::new(vec![band_of(values.clone())]).unwrap();
+        let mut buf = Vec::new();
+        write_geotiff_bands(&raster, &utm_meta(), SampleFormat::U16, &mut buf).unwrap();
+
+        let strip0 = ifd_tag(&buf, 273).unwrap().1;
+        let row_bytes = 3 * 2;
+        let strip1 = strip0 + row_bytes;
+        let offsets_at = buf.len() as u32;
+        buf.extend_from_slice(&strip0.to_le_bytes());
+        buf.extend_from_slice(&strip1.to_le_bytes());
+        let counts_at = buf.len() as u32;
+        buf.extend_from_slice(&row_bytes.to_le_bytes());
+        buf.extend_from_slice(&row_bytes.to_le_bytes());
+
+        let ifd = read_u32_at(&buf, 4) as usize;
+        let entries = read_u16_at(&buf, ifd) as usize;
+        for i in 0..entries {
+            let off = ifd + 2 + i * 12;
+            match read_u16_at(&buf, off) {
+                273 => {
+                    buf[off + 4..off + 8].copy_from_slice(&2u32.to_le_bytes());
+                    buf[off + 8..off + 12].copy_from_slice(&offsets_at.to_le_bytes());
+                }
+                278 => {
+                    buf[off + 8..off + 12].copy_from_slice(&1u32.to_le_bytes());
+                }
+                279 => {
+                    buf[off + 4..off + 8].copy_from_slice(&2u32.to_le_bytes());
+                    buf[off + 8..off + 12].copy_from_slice(&counts_at.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
+
+        let (read, _) = read_geotiff(&buf).unwrap();
+        for row in 0..2 {
+            for col in 0..3 {
+                assert_eq!(read.get(row, col), Some(values[row * 3 + col]));
+            }
+        }
     }
 }
