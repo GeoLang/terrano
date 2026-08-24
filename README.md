@@ -11,6 +11,7 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 
 - **Terrain analysis** — Hillshade, slope (degrees, Horn's method), aspect (0–360°)
 - **Contour generation** — Extract contour lines at configurable intervals with segment connectivity
+- **Viewshed** — line-of-sight visibility from an observer cell, ray cast to every cell inside a radius
 - **Watershed delineation** — D8 watershed boundaries from pour points
 - **Flow direction** — D8 single-direction flow routing from DEM
 - **Flow accumulation** — Upstream area/cell count per pixel
@@ -33,7 +34,7 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 ```rust
 use terrano_core::{
     Raster, slope, hillshade, aspect, contours, polygonize, reclassify, flow_direction,
-    flow_accumulation, watershed, read_geotiff, write_geotiff,
+    flow_accumulation, watershed, viewshed, read_geotiff, write_geotiff,
 };
 
 // Read a DEM from bytes
@@ -55,6 +56,9 @@ let regions = polygonize(&reclassify(&dem, &[(0.0, 500.0, 1.0), (500.0, 2000.0, 
 let flow_dir = flow_direction(&dem);
 let accumulation = flow_accumulation(&flow_dir);
 let basins = watershed(&flow_dir);
+
+// What an observer 2 m above cell (100, 100) can see within 5 km
+let seen = viewshed(&dem, 100, 100, 2.0, 5000.0);
 
 // Write output
 let mut out = std::fs::File::create("slopes.tif").unwrap();

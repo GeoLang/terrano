@@ -18,6 +18,7 @@ mod raster;
 mod rasterize;
 mod terrain;
 mod timeseries;
+mod viewshed;
 mod watershed;
 mod zonal;
 
@@ -40,5 +41,6 @@ pub use raster::Raster;
 pub use rasterize::rasterize;
 pub use terrain::{aspect, hillshade, slope};
 pub use timeseries::{ChangeResult, CompositeMethod, PhenologyMetrics, RasterStack, TrendResult};
+pub use viewshed::{VIEWSHED_HIDDEN, VIEWSHED_VISIBLE, viewshed};
 pub use watershed::{stream_order, watershed};
 pub use zonal::{ZoneStats, zonal_stats};

@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `viewshed` (2026-08-24): line-of-sight visibility from an observer cell. A ray
+  runs from the eye to every cell inside the radius, sampling the terrain
+  bilinearly once per row or column it crosses, and the cell is hidden when a
+  sample stands at a steeper elevation angle than the target. Cells are
+  `VIEWSHED_VISIBLE` or `VIEWSHED_HIDDEN`, and nodata past the radius, on cells
+  the DEM has no elevation for, and everywhere when the observer cell has none.
+  A sample exactly on the line of sight grazes it, so a flat surface stays
+  visible from an eye at ground level, and a nodata sample blocks nothing.
+
 - COG validation in CI (2026-08-14): a `cog-validate` job writes a single-band
   f32 and a multi-band u8 COG through the `validation_cog` example, runs GDAL's
   `validate_cloud_optimized_geotiff.py --full-check` on both, and asserts the
