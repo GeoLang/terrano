@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-02
+
 ### Added
 
 - `viewshed` (2026-08-24): line-of-sight visibility from an observer cell. A ray

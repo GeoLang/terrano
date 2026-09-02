@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "terrano-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "terrano-core",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "terrano-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "flate2",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "terrano-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "terrano-core",
  "wasm-bindgen",

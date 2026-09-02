@@ -97,6 +97,63 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
+<h3>💧 Hydrology</h3>
+<ul>
+<li>D8 flow direction from a DEM</li>
+<li>Flow accumulation per cell</li>
+<li>Strahler stream order above a threshold</li>
+<li>Watershed labels traced to pour points</li>
+<li>Sink filling for depression-free DEMs</li>
+</ul>
+</div>
+<div class="card">
+<h3>👁️ Contours and Visibility</h3>
+<ul>
+<li>Contour lines at any interval and base</li>
+<li>Segments joined into connected lines</li>
+<li>Viewshed cast from one observer cell</li>
+<li>Eye height above ground and a look radius</li>
+</ul>
+</div>
+<div class="card">
+<h3>🔀 Raster and Vector</h3>
+<ul>
+<li>Polygonize equal-value runs into rings with holes</li>
+<li>Rasterize polygons back onto a grid by cell centre</li>
+<li>Focal statistics in a square or circular window</li>
+<li>Zonal statistics grouped by a label raster</li>
+</ul>
+</div>
+<div class="card">
+<h3>📁 File Formats</h3>
+<ul>
+<li>GeoTIFF read and write with the EPSG code</li>
+<li>Cloud Optimized GeoTIFF, tiled with overviews</li>
+<li>Windowed COG reads that fetch only the tiles a window touches</li>
+<li>Eight sample formats, u8 through f64, single or multi-band</li>
+<li>GRIB2 message scanning and NetCDF variable reads</li>
+</ul>
+</div>
+<div class="card">
+<h3>🛰️ Time Series</h3>
+<ul>
+<li><code>RasterStack</code> over timestamped layers</li>
+<li>Mean, median, min, max and standard deviation composites</li>
+<li>Per-pixel linear trend and change detection</li>
+<li>Anomaly z-scores and phenology metrics</li>
+<li>Normalized difference indices such as NDVI</li>
+</ul>
+</div>
+<div class="card">
+<h3>🌐 Browser</h3>
+<ul>
+<li><code>terrano-wasm</code> over flat f64 buffers</li>
+<li>Terrain, algebra, contours, polygonize, focal and zonal</li>
+<li>COG writing through <code>writeCog</code> and <code>writeCogBands</code></li>
+<li>Builds for <code>wasm32-unknown-unknown</code> with no C toolchain</li>
+</ul>
+</div>
+<div class="card">
 <h3>🖥️ CLI</h3>
 <ul>
 <li>Stats: elevation, slope, aspect at center</li>
