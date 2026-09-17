@@ -12,7 +12,7 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 - **Terrain analysis** — Hillshade, slope (degrees, Horn's method), aspect (0–360°)
 - **Contour generation** — Extract contour lines at configurable intervals with segment connectivity
 - **Viewshed** — line-of-sight visibility from an observer cell, ray cast to every cell inside a radius
-- **Watershed delineation** — D8 watershed boundaries from pour points
+- **Watershed delineation** — every cell of a D8 flow direction raster labelled by the pit, flat or edge cell it drains to. Pour points are found by tracing, not supplied
 - **Flow direction** — D8 single-direction flow routing from DEM
 - **Flow accumulation** — Upstream area/cell count per pixel
 - **Stream ordering** — Strahler stream order from flow accumulation

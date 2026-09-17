@@ -45,7 +45,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="badges">
 <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
 <img src="https://img.shields.io/badge/Rust-2024-orange" alt="Rust">
-<img src="https://img.shields.io/badge/tests-passing-brightgreen" alt="Tests">
+<img src="https://github.com/GeoLang/terrano/actions/workflows/ci.yml/badge.svg" alt="CI">
 </div>
 <div class="hero">
 <a href="https://github.com/GeoLang/terrano">GitHub</a>
@@ -93,7 +93,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Configurable cell size</li>
 <li>Nodata sentinel handling</li>
 <li>Random access get/set</li>
-<li>Clone-on-write semantics</li>
+<li>Every operation returns a new raster</li>
 </ul>
 </div>
 <div class="card">
@@ -102,7 +102,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>D8 flow direction from a DEM</li>
 <li>Flow accumulation per cell</li>
 <li>Strahler stream order above a threshold</li>
-<li>Watershed labels traced to pour points</li>
+<li>Watershed labels, one per pit, flat or edge cell the flow traces to</li>
 <li>Sink filling for depression-free DEMs</li>
 </ul>
 </div>
@@ -156,10 +156,10 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>🖥️ CLI</h3>
 <ul>
-<li>Stats: elevation, slope, aspect at center</li>
-<li>Hillshade: configurable sun angle</li>
-<li>Synthetic DEM generation for testing</li>
-<li>A demo harness over that synthetic DEM: it does not read or write raster files, use <code>terrano-core</code> for real work</li>
+<li>Two subcommands, <code>stats</code> and <code>hillshade</code></li>
+<li><code>stats</code> prints elevation, slope and aspect at the centre cell</li>
+<li><code>hillshade</code> takes an azimuth and an altitude</li>
+<li>Both run on a DEM the CLI generates itself. It reads and writes no raster files, so use <code>terrano-core</code> for real work</li>
 </ul>
 </div>
 </div>

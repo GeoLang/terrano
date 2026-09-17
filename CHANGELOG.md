@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- 2026-09-16: Public docs match the code. `watershed` takes a flow direction
+  raster and finds its own pour points, so neither file says pour points go in.
+  The docs page drops "clone-on-write semantics", which `Raster` does not have,
+  names the two CLI subcommands that exist instead of implying a synthetic DEM
+  command, and carries the CI badge rather than a hardcoded green one.
+
 ## [0.2.0] - 2026-09-02
 
 ### Added
