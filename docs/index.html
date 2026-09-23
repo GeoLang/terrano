@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Terrano — Raster Algebra &amp; Terrain Analysis</title>
+<title>Terrano: Raster Algebra &amp; Terrain Analysis</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#58a6ff;--accent2:#3fb950;--muted:#8b949e}
@@ -40,8 +40,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <body>
 <header>
 <div class="container">
-<h1>🏔️ Terrano</h1>
-<p class="tagline">Raster algebra and terrain analysis engine — hillshade, slope, aspect, hydrological modeling.</p>
+<h1>Terrano</h1>
+<p class="tagline">Raster algebra and terrain analysis in pure Rust: hillshade, slope, aspect, hydrology and Cloud Optimized GeoTIFF.</p>
 <div class="badges">
 <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
 <img src="https://img.shields.io/badge/Rust-2024-orange" alt="Rust">
@@ -67,17 +67,17 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h2 id="features">Features</h2>
 <div class="grid">
 <div class="card">
-<h3>🏔️ Terrain Analysis</h3>
+<h3>Terrain Analysis</h3>
 <ul>
-<li>Hillshade (configurable azimuth/altitude)</li>
+<li>Hillshade from a sun azimuth and altitude, 0 to 255</li>
 <li>Slope (degrees, Horn's method)</li>
-<li>Aspect (0–360°, north-referenced)</li>
+<li>Aspect in degrees clockwise from north, flat cells left nodata</li>
 <li>3×3 gradient kernel (Horn's algorithm)</li>
 <li>Nodata-aware processing</li>
 </ul>
 </div>
 <div class="card">
-<h3>🧮 Map Algebra</h3>
+<h3>Map Algebra</h3>
 <ul>
 <li>Unary: add, multiply, sqrt, abs, log</li>
 <li>Binary: add, subtract, multiply, divide</li>
@@ -87,7 +87,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>📊 Raster Type</h3>
+<h3>Raster Type</h3>
 <ul>
 <li>2D grid (row-major f64)</li>
 <li>Configurable cell size</li>
@@ -97,7 +97,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>💧 Hydrology</h3>
+<h3>Hydrology</h3>
 <ul>
 <li>D8 flow direction from a DEM</li>
 <li>Flow accumulation per cell</li>
@@ -107,7 +107,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>👁️ Contours and Visibility</h3>
+<h3>Contours and Visibility</h3>
 <ul>
 <li>Contour lines at any interval and base</li>
 <li>Segments joined into connected lines</li>
@@ -116,7 +116,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🔀 Raster and Vector</h3>
+<h3>Raster and Vector</h3>
 <ul>
 <li>Polygonize equal-value runs into rings with holes</li>
 <li>Rasterize polygons back onto a grid by cell centre</li>
@@ -125,17 +125,17 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>📁 File Formats</h3>
+<h3>File Formats</h3>
 <ul>
 <li>GeoTIFF read and write with the EPSG code</li>
 <li>Cloud Optimized GeoTIFF, tiled with overviews</li>
 <li>Windowed COG reads that fetch only the tiles a window touches</li>
 <li>Eight sample formats, u8 through f64, single or multi-band</li>
-<li>GRIB2 message scanning and NetCDF variable reads</li>
+<li>GRIB2 simple-packed messages and NetCDF classic variables</li>
 </ul>
 </div>
 <div class="card">
-<h3>🛰️ Time Series</h3>
+<h3>Time Series</h3>
 <ul>
 <li><code>RasterStack</code> over timestamped layers</li>
 <li>Mean, median, min, max and standard deviation composites</li>
@@ -145,7 +145,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🌐 Browser</h3>
+<h3>Browser</h3>
 <ul>
 <li><code>terrano-wasm</code> over flat f64 buffers</li>
 <li>Terrain, algebra, contours, polygonize, focal and zonal</li>
@@ -154,7 +154,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🖥️ CLI</h3>
+<h3>CLI</h3>
 <ul>
 <li>Two subcommands, <code>stats</code> and <code>hillshade</code></li>
 <li><code>stats</code> prints elevation, slope and aspect at the centre cell</li>
@@ -172,8 +172,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <pre><code>use terrano_core::{Raster, slope, hillshade};
 
 let dem = Raster::from_vec(100, 100, elevation_data, 10.0, -9999.0).unwrap();
-let slopes = slope(&amp;dem);       // degrees
-let hs = hillshade(&amp;dem, 315.0, 45.0);  // sun from NW at 45°</code></pre>
+let slopes = slope(&amp;dem);             // degrees
+let hs = hillshade(&amp;dem, 315.0, 45.0);  // sun from the northwest, 45° up</code></pre>
 </div>
 </section>
 

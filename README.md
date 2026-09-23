@@ -9,26 +9,26 @@ Raster algebra and terrain analysis engine for the GeoLang GIS stack.
 
 ## Features
 
-- **Terrain analysis** — Hillshade, slope (degrees, Horn's method), aspect (0–360°)
-- **Contour generation** — Extract contour lines at configurable intervals with segment connectivity
-- **Viewshed** — line-of-sight visibility from an observer cell, ray cast to every cell inside a radius
-- **Watershed delineation** — every cell of a D8 flow direction raster labelled by the pit, flat or edge cell it drains to. Pour points are found by tracing, not supplied
-- **Flow direction** — D8 single-direction flow routing from DEM
-- **Flow accumulation** — Upstream area/cell count per pixel
-- **Stream ordering** — Strahler stream order from flow accumulation
-- **Sink filling** — Remove depressions for hydrologically-correct DEMs
-- **Map algebra** — Unary (add, multiply, sqrt, abs, log) and binary (add, subtract, multiply, divide, min, max) operations
-- **Reclassification** — Value-range-based class assignment
-- **Polygonize** — Connected runs of equal cells traced as polygon rings with holes, for a classified raster
-- **Rasterize** — Polygons burnt onto a grid by cell centre, holes cut out, the inverse of polygonize
-- **Focal statistics** — Moving-window min/max/mean/sum/std/median/majority/range over a square or circular neighbourhood
-- **Zonal statistics** — Per-zone summary of one raster grouped by the labels of another
-- **GeoTIFF I/O** — Read and write GeoTIFF rasters with CRS metadata
-- **Multi-band rasters** — `BandedRaster` holds RGB/RGBA or any band set on one grid, written and read as a multi-band GeoTIFF in any `SampleFormat`
-- **Cloud Optimized GeoTIFF (COG)** — tiled writing with overview pyramids (raw or deflate), validated in CI against GDAL's `validate_cloud_optimized_geotiff.py` (full check, overviews asserted), and windowed reads over a byte-range seam (`CogReader` fetches only the tiles a window touches, wire it to `Range` requests for remote streaming). Writes any `SampleFormat` (u8, i8, u16, i16, u32, i32, f32, f64) with the geo tags, GDAL_NODATA, and the IFD and tile ordering the COG spec calls for. Reads real-world single-band COGs: deflate, horizontal and floating-point predictors, integer and float sample types, GDAL nodata mapped to NaN. Multi-band COGs are pixel-interleaved through `write_cog_bands` and `CogReader::read_window_bands`. The writer runs in the browser too, via `writeCog` and `writeCogBands` in terrano-wasm
-- **GRIB2 and NetCDF** — message scanning and variable reads for gridded weather and climate data
-- **EO time-series** — `RasterStack` for multi-temporal analysis: composites (mean/median/min/max/standard deviation), linear trend fitting, change detection, anomaly z-scores, phenology metrics, normalized difference indices (NDVI, NDWI, etc.)
-- **Browser build** — `terrano-wasm` is a wasm-bindgen surface over terrano-core taking flat f64 buffers: `hillshade`, `slope`, `aspect`, `fillSinks`, `reclassify`, `applyUnary`, `applyBinary`, `normalizedDifference`, `contours`, `polygonize`, `rasterize`, `focalStats`, `zonalStats`, `writeCog` and `writeCogBands`. terrano-core depends only on thiserror and flate2, so it builds for `wasm32-unknown-unknown` with no C toolchain
+- **Terrain analysis**: hillshade (0 to 255), slope in degrees and aspect in degrees clockwise from north, all from Horn's 3x3 gradient
+- **Contours**: lines at a given interval and base, segments joined into connected lines
+- **Viewshed**: line-of-sight visibility from an observer cell, ray cast to every cell inside a radius
+- **Watershed delineation**: every cell of a D8 flow direction raster labelled by the pit, flat or edge cell it drains to. Pour points are found by tracing, not supplied
+- **Flow direction**: D8 flow direction from a DEM
+- **Flow accumulation**: count of upstream cells draining into each cell
+- **Stream ordering**: Strahler order for cells above a flow accumulation threshold
+- **Sink filling**: `fill_sinks` raises depressions so every cell drains to an edge
+- **Map algebra**: unary (add, multiply, sqrt, abs, log) and binary (add, subtract, multiply, divide, min, max) operations
+- **Reclassification**: value ranges mapped to class values
+- **Polygonize**: connected runs of equal cells traced as polygon rings with holes, for a classified raster
+- **Rasterize**: polygons burnt onto a grid by cell centre, holes cut out, the inverse of polygonize
+- **Focal statistics**: moving-window min/max/mean/sum/std/median/majority/range over a square or circular neighbourhood
+- **Zonal statistics**: per-zone summary of one raster grouped by the labels of another
+- **GeoTIFF I/O**: read and write GeoTIFF rasters with origin, pixel size and EPSG code
+- **Multi-band rasters**: `BandedRaster` holds RGB/RGBA or any band set on one grid, written and read as a multi-band GeoTIFF in any `SampleFormat`
+- **Cloud Optimized GeoTIFF (COG)**: tiled writing with overview pyramids (raw or deflate), validated in CI against GDAL's `validate_cloud_optimized_geotiff.py` (full check, overviews asserted), and windowed reads through the `RangeRead` trait (`CogReader` fetches only the tiles a window touches, so an implementation backed by HTTP `Range` requests reads a remote file). Writes any `SampleFormat` (u8, i8, u16, i16, u32, i32, f32, f64) with the geo tags, GDAL_NODATA, and the IFD and tile ordering the COG spec calls for. Reads real-world single-band COGs: deflate, horizontal and floating-point predictors, integer and float sample types, GDAL nodata mapped to NaN. Multi-band COGs are pixel-interleaved through `write_cog_bands` and `CogReader::read_window_bands`. The writer runs in the browser too, via `writeCog` and `writeCogBands` in terrano-wasm
+- **GRIB2 and NetCDF**: `grib::scan_grib` lists the messages in a GRIB2 file and `grib::decode_grib_message` decodes simple-packed ones (other packings return an error). `netcdf::read_netcdf_metadata` and `netcdf::read_netcdf_variable` read NetCDF classic and 64-bit offset files, not NetCDF-4
+- **EO time-series**: `RasterStack` for multi-temporal analysis: composites (mean/median/min/max/standard deviation), linear trend fitting, change detection, anomaly z-scores, phenology metrics, normalized difference indices (NDVI, NDWI, etc.)
+- **Browser build**: `terrano-wasm` is a wasm-bindgen surface over terrano-core taking flat f64 buffers: `hillshade`, `slope`, `aspect`, `fillSinks`, `reclassify`, `applyUnary`, `applyBinary`, `normalizedDifference`, `contours`, `polygonize`, `rasterize`, `focalStats`, `zonalStats`, `writeCog` and `writeCogBands`. terrano-core depends only on thiserror and flate2, so it builds for `wasm32-unknown-unknown` with no C toolchain
 
 ## Usage
 
@@ -58,7 +58,7 @@ let flow_dir = flow_direction(&dem);
 let accumulation = flow_accumulation(&flow_dir);
 let basins = watershed(&flow_dir);
 
-// What an observer 2 m above cell (100, 100) can see within 5 km
+// Cells visible from 2 elevation units above cell (100, 100), out to 5000 map units
 let seen = viewshed(&dem, 100, 100, 2.0, 5000.0);
 
 // Write output
@@ -69,8 +69,8 @@ write_geotiff(&slopes, &meta, &mut out).unwrap();
 ## COG sample formats
 
 `CogParams::format` picks the sample type, `SampleFormat::F64` by default. An
-8-bit image written as `U8` is an eighth the size of the same image as `F64`,
-which is what the browser path through `writeCog` cares about.
+8-bit image written as `U8` is an eighth the size of the same image as `F64`.
+In terrano-wasm, `writeCog` takes the format as a string, `"u8"` through `"f64"`.
 
 ```rust
 use terrano_core::{CogParams, SampleFormat, write_cog};
@@ -99,15 +99,16 @@ Nodata means different things per format:
   at all: a NaN sample is then an error rather than a silent zero, and only the
   padding past the image edge is filled with zero.
 
-One caveat inherent to integer rasters: a block average can round onto the
+On integer formats a block average can round onto the
 nodata value, which turns a cell of real data into an absent one in that
 overview level. Pick a nodata at the edge of the range, not in the middle of
 the data.
 
 ## CLI
 
-The CLI is a demo harness over a synthetic DEM, it does not read or write raster files yet.
-Use `terrano-core` directly for real work.
+The `terrano` binary runs on a DEM it generates itself and reads or writes no
+raster files. Use `terrano-core` for real work. `stats` prints elevation, slope
+and aspect at the centre cell, `hillshade` prints the hillshade value there.
 
 ```sh
 terrano stats --width 10 --height 10
