@@ -613,7 +613,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = terrano_core::CogReader::open(bytes.as_slice()).unwrap();
+        let reader = terrano_core::CogReader::open(bytes.as_slice()).unwrap();
         assert_eq!(
             reader.levels().len(),
             3,
@@ -646,7 +646,7 @@ mod tests {
             wide.len()
         );
 
-        let mut reader = terrano_core::CogReader::open(narrow.as_slice()).unwrap();
+        let reader = terrano_core::CogReader::open(narrow.as_slice()).unwrap();
         let window = reader.read_window(0, 0, 0, width, height).unwrap();
         for (got, want) in window.data().iter().zip(&data) {
             assert_eq!(got, want);
@@ -666,7 +666,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = terrano_core::CogReader::open(bytes.as_slice()).unwrap();
+        let reader = terrano_core::CogReader::open(bytes.as_slice()).unwrap();
         let window = reader.read_window_bands(0, 0, 0, width, height).unwrap();
         assert_eq!(window.band_count(), 3);
         for band in 0..3 {

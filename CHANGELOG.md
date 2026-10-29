@@ -4,7 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-28
+
 ### Changed
+
+- 2026-10-28: `RangeRead::read_range` and `read_ranges` take `&self`, and so
+  do `CogReader::read_window` and `read_window_bands`, so one reader serves
+  concurrent window reads without a lock. The `File` impl reads at an offset
+  instead of seeking. This breaks every `RangeRead` impl, which drops its
+  `&mut`.
 
 - 2026-09-16: Public docs match the code. `watershed` takes a flow direction
   raster and finds its own pour points, so neither file says pour points go in.

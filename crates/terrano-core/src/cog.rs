@@ -762,11 +762,11 @@ fn write_u32<W: Write>(writer: &mut W, v: u32) -> Result<(), io::Error> {
 /// transport. implement it over an http client with `Range` requests to
 /// stream remote files, the reader never asks for more than it needs
 pub trait RangeRead {
-    fn read_range(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, Error>;
+    fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, Error>;
 
     /// several ranges in one call, results in request order. transports
     /// that can multiplex override this, the default reads sequentially
-    fn read_ranges(&mut self, ranges: &[(u64, u64)]) -> Result<Vec<Vec<u8>>, Error> {
+    fn read_ranges(&self, ranges: &[(u64, u64)]) -> Result<Vec<Vec<u8>>, Error> {
         ranges
             .iter()
             .map(|&(offset, len)| self.read_range(offset, len))
@@ -775,17 +775,32 @@ pub trait RangeRead {
 }
 
 impl RangeRead for std::fs::File {
-    fn read_range(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
-        use std::io::{Read, Seek, SeekFrom};
-        self.seek(SeekFrom::Start(offset))?;
+    #[cfg(unix)]
+    fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
+        use std::os::unix::fs::FileExt;
         let mut buf = vec![0u8; len as usize];
-        self.read_exact(&mut buf)?;
+        self.read_exact_at(&mut buf, offset)?;
+        Ok(buf)
+    }
+
+    #[cfg(windows)]
+    fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
+        use std::os::windows::fs::FileExt;
+        let mut buf = vec![0u8; len as usize];
+        let mut filled = 0;
+        while filled < buf.len() {
+            let read = self.seek_read(&mut buf[filled..], offset + filled as u64)?;
+            if read == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+            }
+            filled += read;
+        }
         Ok(buf)
     }
 }
 
 impl RangeRead for &[u8] {
-    fn read_range(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
+    fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
         let start = offset as usize;
         let end = start + len as usize;
         if end > self.len() {
@@ -836,7 +851,7 @@ pub struct CogReader<R: RangeRead> {
 }
 
 impl<R: RangeRead> CogReader<R> {
-    pub fn open(mut source: R) -> Result<Self, Error> {
+    pub fn open(source: R) -> Result<Self, Error> {
         let header = source.read_range(0, 8)?;
         if &header[0..2] != b"II" || u16::from_le_bytes([header[2], header[3]]) != 42 {
             return Err(Error::Format("not a little-endian tiff".into()));
@@ -849,7 +864,7 @@ impl<R: RangeRead> CogReader<R> {
         while next != 0 {
             let count = u16::from_le_bytes(source.read_range(next, 2)?.try_into().unwrap()) as u64;
             let block = source.read_range(next + 2, count * 12 + 4)?;
-            let (level, level_meta, following) = parse_ifd(&mut source, &block, count as usize)?;
+            let (level, level_meta, following) = parse_ifd(&source, &block, count as usize)?;
             levels.push(level);
             if meta.is_none() {
                 meta = Some(level_meta);
@@ -891,7 +906,7 @@ impl<R: RangeRead> CogReader<R> {
     /// read a pixel window from one level, fetching only intersecting
     /// tiles. pixels outside the image come back NaN
     pub fn read_window(
-        &mut self,
+        &self,
         level: usize,
         col0: usize,
         row0: usize,
@@ -912,7 +927,7 @@ impl<R: RangeRead> CogReader<R> {
     /// decoding each touched tile once. single-band files come back with
     /// one band. pixels outside the image come back NaN
     pub fn read_window_bands(
-        &mut self,
+        &self,
         level: usize,
         col0: usize,
         row0: usize,
@@ -1129,7 +1144,7 @@ impl ShortList {
         Self { count, inline }
     }
 
-    fn resolve<R: RangeRead>(&self, source: &mut R) -> Result<Vec<u16>, Error> {
+    fn resolve<R: RangeRead>(&self, source: &R) -> Result<Vec<u16>, Error> {
         if self.count == 0 {
             return Ok(Vec::new());
         }
@@ -1148,7 +1163,7 @@ impl ShortList {
 }
 
 fn parse_ifd<R: RangeRead>(
-    source: &mut R,
+    source: &R,
     block: &[u8],
     count: usize,
 ) -> Result<(CogLevel, GeoTiffMetadata, u64), Error> {
@@ -1281,7 +1296,7 @@ fn parse_ifd<R: RangeRead>(
         None
     };
 
-    let read_u32s = |source: &mut R, at: u32, n: usize| -> Result<Vec<u64>, Error> {
+    let read_u32s = |source: &R, at: u32, n: usize| -> Result<Vec<u64>, Error> {
         let bytes = source.read_range(u64::from(at), n as u64 * 4)?;
         Ok(bytes
             .chunks_exact(4)
@@ -1363,6 +1378,7 @@ fn parse_ifd<R: RangeRead>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn test_raster(width: usize, height: usize) -> Raster {
         let mut data = vec![0.0; width * height];
@@ -1507,14 +1523,13 @@ mod tests {
 
     struct RecordingReader<'a> {
         data: &'a [u8],
-        fetched: usize,
+        fetched: Cell<usize>,
     }
 
     impl RangeRead for RecordingReader<'_> {
-        fn read_range(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
-            self.fetched += len as usize;
-            let mut slice = self.data;
-            slice.read_range(offset, len)
+        fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
+            self.fetched.set(self.fetched.get() + len as usize);
+            self.data.read_range(offset, len)
         }
     }
 
@@ -1540,7 +1555,7 @@ mod tests {
     #[test]
     fn read_window_roundtrips_full_resolution() {
         let (raster, bytes) = write_test_cog(100, 80, 2, 4326);
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let window = reader.read_window(0, 7, 5, 40, 30).unwrap();
         for row in 0..30 {
             for col in 0..40 {
@@ -1558,7 +1573,7 @@ mod tests {
     fn read_window_overview_matches_generated() {
         let (raster, bytes) = write_test_cog(64, 64, 1, 4326);
         let overviews = generate_overviews(&raster, 1);
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         assert_eq!(reader.levels().len(), 2);
         let window = reader.read_window(1, 0, 0, 32, 32).unwrap();
         for i in 0..32 * 32 {
@@ -1569,7 +1584,7 @@ mod tests {
     #[test]
     fn read_window_pads_outside_with_nan() {
         let (_, bytes) = write_test_cog(20, 20, 0, 4326);
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let window = reader.read_window(0, 10, 10, 20, 20).unwrap();
         assert!(!window.data()[0].is_nan());
         assert!(window.data()[20 * 10 + 15].is_nan());
@@ -1604,14 +1619,14 @@ mod tests {
     fn window_read_fetches_a_fraction_of_the_file() {
         let (_, bytes) = write_test_cog(512, 512, 0, 4326);
         let total = bytes.len();
-        let mut reader = CogReader::open(RecordingReader {
+        let reader = CogReader::open(RecordingReader {
             data: &bytes,
-            fetched: 0,
+            fetched: Cell::new(0),
         })
         .unwrap();
         let window = reader.read_window(0, 100, 100, 16, 16).unwrap();
         assert!(!window.data()[0].is_nan());
-        let fetched = reader.source.fetched;
+        let fetched = reader.source.fetched.get();
         assert!(
             fetched * 10 < total,
             "fetched {fetched} of {total} bytes for one small window"
@@ -1646,7 +1661,7 @@ mod tests {
             "deflate did not shrink the file"
         );
 
-        let mut reader = CogReader::open(packed.as_slice()).unwrap();
+        let reader = CogReader::open(packed.as_slice()).unwrap();
         let window = reader.read_window(0, 0, 0, 100, 80).unwrap();
         for (a, b) in window.data().iter().zip(raster.data()) {
             assert!((a - b).abs() < 1e-12);
@@ -1732,7 +1747,7 @@ mod tests {
     }
 
     fn read_all(bytes: &[u8], w: usize, h: usize) -> Vec<f64> {
-        let mut reader = CogReader::open(bytes).unwrap();
+        let reader = CogReader::open(bytes).unwrap();
         reader.read_window(0, 0, 0, w, h).unwrap().data().to_vec()
     }
 
@@ -1888,7 +1903,7 @@ mod tests {
             for deflate in [false, true] {
                 let bands = test_bands(40, 30, count);
                 let bytes = write_test_cog_bands(&bands, deflate);
-                let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+                let reader = CogReader::open(bytes.as_slice()).unwrap();
                 assert_eq!(reader.levels().len(), 2);
                 assert_eq!(reader.levels()[0].samples, count);
 
@@ -1919,7 +1934,7 @@ mod tests {
     fn banded_window_offset_from_the_origin() {
         let bands = test_bands(40, 30, 3);
         let bytes = write_test_cog_bands(&bands, true);
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let window = reader.read_window_bands(0, 7, 5, 20, 18).unwrap();
         for b in 0..3 {
             let src = bands.band(b).unwrap().data();
@@ -1936,7 +1951,7 @@ mod tests {
     #[test]
     fn read_window_on_a_multi_band_cog_points_at_read_window_bands() {
         let bytes = write_test_cog_bands(&test_bands(20, 20, 3), false);
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let err = reader.read_window(0, 0, 0, 4, 4).unwrap_err().to_string();
         assert!(err.contains("read_window_bands"), "unhelpful error: {err}");
         assert!(err.contains('3'), "error omits the sample count: {err}");
@@ -1945,7 +1960,7 @@ mod tests {
     #[test]
     fn single_band_agrees_through_both_paths() {
         let (raster, bytes) = write_test_cog(64, 48, 1, 4326);
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let plain = reader.read_window(0, 3, 4, 20, 20).unwrap();
         let banded = reader.read_window_bands(0, 3, 4, 20, 20).unwrap();
         assert_eq!(banded.band_count(), 1);
@@ -2047,7 +2062,7 @@ mod tests {
             }
         }
         let tiff = build_banded_tiff(16, 16, &[16; 3], &[1; 3], 1, &raw);
-        let mut reader = CogReader::open(tiff.as_slice()).unwrap();
+        let reader = CogReader::open(tiff.as_slice()).unwrap();
         let got = reader.read_window_bands(0, 0, 0, 16, 16).unwrap();
         assert_eq!(got.band_count(), 3);
         for (b, band) in bands.iter().enumerate() {
@@ -2365,7 +2380,7 @@ mod tests {
         assert_eq!(f64_at(&bytes, tile + (3 * 16 + 5) * 8), -9999.0);
 
         // and terrano's reader maps it back to NaN
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let window = reader.read_window(0, 0, 0, 40, 40).unwrap();
         assert!(window.get(3, 5).unwrap().is_nan());
         assert!(window.get(20, 21).unwrap().is_nan());
@@ -2461,7 +2476,7 @@ mod tests {
                 wide.len()
             );
 
-            let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+            let reader = CogReader::open(bytes.as_slice()).unwrap();
             let window = reader.read_window(0, 0, 0, 64, 64).unwrap();
             for (i, (got, want)) in window.data().iter().zip(raster.data()).enumerate() {
                 assert_eq!(got, want, "{} at {i}", format.name());
@@ -2474,7 +2489,7 @@ mod tests {
         let raster = integer_raster(32, 32, -2000.0, 2000.0);
         let bytes = write_cog_as(&raster, SampleFormat::I16, Some(-32768.0));
 
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let base = reader.read_window(0, 0, 0, 32, 32).unwrap();
         assert_eq!(base.data(), raster.data());
         assert!(
@@ -2497,14 +2512,14 @@ mod tests {
         let raster =
             Raster::from_vec(2, 2, vec![255.0, 255.0, 254.0, 255.0], 1.0, -9999.0).unwrap();
         let bytes = write_cog_as(&raster, SampleFormat::U8, None);
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let overview = reader.read_window(1, 0, 0, 1, 1).unwrap();
         assert_eq!(overview.data()[0], 255.0, "254.75 should round to 255");
 
         let raster =
             Raster::from_vec(2, 2, vec![-128.0, -128.0, -127.0, -128.0], 1.0, -9999.0).unwrap();
         let bytes = write_cog_as(&raster, SampleFormat::I8, None);
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let overview = reader.read_window(1, 0, 0, 1, 1).unwrap();
         assert_eq!(overview.data()[0], -128.0, "-127.75 should round to -128");
     }
@@ -2513,7 +2528,7 @@ mod tests {
     fn integer_samples_out_of_range_clamp_instead_of_wrapping() {
         let raster = Raster::from_vec(2, 2, vec![-5.0, 300.0, 12.6, 255.0], 1.0, -9999.0).unwrap();
         let bytes = write_cog_as(&raster, SampleFormat::U8, None);
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let window = reader.read_window(0, 0, 0, 2, 2).unwrap();
         assert_eq!(window.data(), &[0.0, 255.0, 13.0, 255.0]);
     }
@@ -2529,7 +2544,7 @@ mod tests {
         let tile = ifd.tile_offsets(&bytes)[0] as usize;
         assert_eq!(u16_at(&bytes, tile + (3 * 16 + 5) * 2), 65535);
 
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let window = reader.read_window(0, 0, 0, 40, 40).unwrap();
         assert!(window.get(3, 5).unwrap().is_nan());
         assert_eq!(window.get(0, 1).unwrap(), raster.get(0, 1).unwrap());
@@ -2611,7 +2626,7 @@ mod tests {
             assert_eq!(u16_at(&bytes, at as usize + i * 2), 1, "band {i} format");
         }
 
-        let mut reader = CogReader::open(bytes.as_slice()).unwrap();
+        let reader = CogReader::open(bytes.as_slice()).unwrap();
         let read = reader.read_window_bands(0, 0, 0, 40, 40).unwrap();
         for b in 0..3 {
             assert_close(
@@ -2648,7 +2663,7 @@ mod tests {
             plain.len()
         );
 
-        let mut reader = CogReader::open(squeezed.as_slice()).unwrap();
+        let reader = CogReader::open(squeezed.as_slice()).unwrap();
         let window = reader.read_window(0, 0, 0, 64, 64).unwrap();
         for i in 0..64 * 64 {
             assert_eq!(window.data()[i], raster.data()[i]);
