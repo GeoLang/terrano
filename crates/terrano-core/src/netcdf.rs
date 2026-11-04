@@ -1,4 +1,7 @@
-//! NetCDF reader — extract raster data from NetCDF-4 / NetCDF Classic files.
+//! NetCDF reader: extract raster data from NetCDF classic and 64-bit offset files.
+//!
+//! NetCDF-4 files use an HDF5 container and return `Error::Format`, and so do
+//! CDF-5 files.
 //!
 //! Provides a lightweight reader for structured gridded datasets commonly
 //! used in climate science, oceanography, and meteorology.
