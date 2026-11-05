@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- 2026-11-05: `write_cog_tiles` writes a COG one tile at a time from a
+  callback, coarsest level first, into a seekable writer, and produces the same
+  bytes as `write_cog_bands` for the same tiles. `SampleFormat::encode` and
+  `SampleFormat::decode` are public so a caller can build those tiles.
+
+### Changed
+
+- 2026-11-04: CI and the release workflow call the reusable workflows in
+  `GeoLang/.github`. The `terrano-<target>.tar.gz` archives are unchanged.
+
+### Fixed
+
+- 2026-11-05: `CogReader` sizes an overview with no ModelPixelScale tag from the
+  ratio of its dimensions to the full image, so `select_level` picks GDAL
+  overviews. A full-resolution IFD with no ModelPixelScale or ModelTiepoint is
+  an error at open. `CogReader` and `read_geotiff_bands` move the origin of a
+  PixelIsPoint file by half a pixel to the corner of the first pixel.
+- 2026-11-05: `CogReader` applies GDAL internal transparency masks of 1 or 8
+  bits, so masked pixels read back NaN at every level, and reads TileByteCounts
+  stored as SHORT. `CogReader::open` returns an error for a file whose masks do
+  not cover every level. `CogReader` reads an image tile with no bytes as NaN
+  if the file declares nodata and as zero otherwise, and requests no
+  zero-length range for it. `CogReader` and `read_geotiff_bands` honour nonzero
+  tiepoint raster coordinates I and J.
+
 ## [0.3.0] - 2026-10-28
 
 ### Changed

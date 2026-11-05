@@ -109,7 +109,7 @@ impl SampleFormat {
     }
 
     /// Append one little-endian sample.
-    pub(crate) fn encode(self, value: f64, out: &mut Vec<u8>) {
+    pub fn encode(self, value: f64, out: &mut Vec<u8>) {
         let value = match self.integer_range() {
             // a saturating cast, so NaN lands on 0
             Some((low, high)) => value.round().clamp(low, high),
@@ -128,7 +128,7 @@ impl SampleFormat {
     }
 
     /// Widen one little-endian sample from the start of `bytes`.
-    pub(crate) fn decode(self, bytes: &[u8]) -> f64 {
+    pub fn decode(self, bytes: &[u8]) -> f64 {
         let two = || u16::from_le_bytes(bytes[..2].try_into().unwrap());
         let four = || u32::from_le_bytes(bytes[..4].try_into().unwrap());
         match self {
@@ -483,12 +483,14 @@ pub fn read_geotiff_bands(data: &[u8]) -> Result<(BandedRaster, GeoTiffMetadata)
         }
     }
 
-    let meta = geo_meta_from(
-        data,
-        pixel_scale_offset,
-        tiepoint_offset,
-        geo_keys_offset,
-        geo_keys_count,
+    let tag_bytes = |offset: u32, len: usize| {
+        data.get(offset as usize..offset as usize + len)
+            .ok_or_else(|| Error::Format("georeferencing tag outside file".into()))
+    };
+    let meta = geo_metadata(
+        tag_bytes(pixel_scale_offset, 24)?,
+        tag_bytes(tiepoint_offset, 48)?,
+        tag_bytes(geo_keys_offset, geo_keys_count as usize * 2)?,
     );
 
     let nodata = -9999.0;
@@ -569,28 +571,35 @@ fn first_ifd_offset(data: &[u8]) -> Result<usize, Error> {
     Ok(ifd_offset)
 }
 
-fn geo_meta_from(
-    data: &[u8],
-    pixel_scale_offset: u32,
-    tiepoint_offset: u32,
-    geo_keys_offset: u32,
-    geo_keys_count: u32,
+pub(crate) fn geo_metadata(
+    pixel_scale: &[u8],
+    tiepoint: &[u8],
+    geo_keys: &[u8],
 ) -> GeoTiffMetadata {
-    let pixel_width = read_f64_at(data, pixel_scale_offset as usize);
-    let pixel_height = read_f64_at(data, pixel_scale_offset as usize + 8);
-    let origin_x = read_f64_at(data, tiepoint_offset as usize + 24);
-    let origin_y = read_f64_at(data, tiepoint_offset as usize + 32);
+    let pixel_width = read_f64_at(pixel_scale, 0);
+    let pixel_height = read_f64_at(pixel_scale, 8);
+    // geotiff ModelTiepoint is raster I, J, K followed by model X, Y, Z
+    let mut origin_x = read_f64_at(tiepoint, 24) - read_f64_at(tiepoint, 0) * pixel_width;
+    let mut origin_y = read_f64_at(tiepoint, 32) + read_f64_at(tiepoint, 8) * pixel_height;
 
     let mut epsg = 0u16;
-    if geo_keys_count >= 8 {
+    if geo_keys.len() >= 16 {
         // skip the 4-short header, then read key entries
-        let num_keys = read_u16_at(data, geo_keys_offset as usize + 6) as usize;
+        let num_keys = read_u16_at(geo_keys, 6) as usize;
         for k in 0..num_keys {
-            let base = geo_keys_offset as usize + 8 + k * 8;
-            let key_id = read_u16_at(data, base);
-            let key_val = read_u16_at(data, base + 6);
+            let base = 8 + k * 8;
+            if base + 8 > geo_keys.len() {
+                break;
+            }
+            let key_id = read_u16_at(geo_keys, base);
+            let key_val = read_u16_at(geo_keys, base + 6);
             if key_id == 2048 || key_id == 3072 {
                 epsg = key_val;
+            }
+            // geotiff RasterPixelIsPoint puts the tiepoint on the center of its pixel
+            if key_id == 1025 && key_val == 2 {
+                origin_x -= pixel_width / 2.0;
+                origin_y += pixel_height / 2.0;
             }
         }
     }
@@ -1046,6 +1055,41 @@ mod tests {
             }
         }
         assert!(read_geotiff(&buf).is_err());
+    }
+
+    #[test]
+    fn pixel_is_point_moves_the_origin_from_the_pixel_center_to_its_corner() {
+        let mut buf = Vec::new();
+        write_geotiff(&band_of(vec![1.0; 6]), &utm_meta(), &mut buf).unwrap();
+        let keys_at = ifd_tag(&buf, 34735).unwrap().1 as usize;
+        buf[keys_at + 8..keys_at + 10].copy_from_slice(&1025u16.to_le_bytes());
+        buf[keys_at + 14..keys_at + 16].copy_from_slice(&2u16.to_le_bytes());
+
+        let (_, meta) = read_geotiff(&buf).unwrap();
+        assert_eq!(meta.origin_x, 499995.0);
+        assert_eq!(meta.origin_y, 4500005.0);
+        assert_eq!(meta.pixel_width, 10.0);
+        assert_eq!(meta.epsg, 32632);
+    }
+
+    #[test]
+    fn tiepoint_raster_position_moves_the_origin_to_the_first_pixel() {
+        let mut buf = Vec::new();
+        write_geotiff(&band_of(vec![1.0; 6]), &utm_meta(), &mut buf).unwrap();
+        let tiepoint_at = ifd_tag(&buf, 33922).unwrap().1 as usize;
+        buf[tiepoint_at..tiepoint_at + 8].copy_from_slice(&3.0f64.to_le_bytes());
+        buf[tiepoint_at + 8..tiepoint_at + 16].copy_from_slice(&2.0f64.to_le_bytes());
+
+        let (_, meta) = read_geotiff(&buf).unwrap();
+        assert_eq!(meta.origin_x, 499970.0);
+        assert_eq!(meta.origin_y, 4500020.0);
+
+        let keys_at = ifd_tag(&buf, 34735).unwrap().1 as usize;
+        buf[keys_at + 8..keys_at + 10].copy_from_slice(&1025u16.to_le_bytes());
+        buf[keys_at + 14..keys_at + 16].copy_from_slice(&2u16.to_le_bytes());
+        let (_, meta) = read_geotiff(&buf).unwrap();
+        assert_eq!(meta.origin_x, 499965.0);
+        assert_eq!(meta.origin_y, 4500025.0);
     }
 
     #[test]

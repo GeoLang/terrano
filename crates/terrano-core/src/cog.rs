@@ -20,9 +20,9 @@
 
 use crate::Error;
 use crate::banded::BandedRaster;
-use crate::geotiff::{GeoTiffMetadata, SampleFormat};
+use crate::geotiff::{GeoTiffMetadata, SampleFormat, geo_metadata};
 use crate::raster::Raster;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 
 /// Configuration for COG output.
 #[derive(Debug, Clone)]
@@ -208,6 +208,9 @@ fn write_bands<W: Write>(
     let overviews = &per_band[0];
 
     check_nodata(params.format, params.nodata)?;
+    let sizes: Vec<(usize, usize)> = std::iter::once((width, height))
+        .chain(overviews.iter().map(|ov| (ov.width, ov.height)))
+        .collect();
     let mut all_tile_data: Vec<Vec<Vec<u8>>> = Vec::new();
     let planes: Vec<&[f64]> = bands.iter().map(|b| b.data()).collect();
     all_tile_data.push(bands_to_tiles(
@@ -234,26 +237,100 @@ fn write_bands<W: Write>(
     if params.deflate {
         for tiles in &mut all_tile_data {
             for tile in tiles.iter_mut() {
-                let mut enc =
-                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-                enc.write_all(tile)?;
-                *tile = enc.finish()?;
+                *tile = deflated(tile)?;
             }
         }
     }
 
-    // per-ifd byte footprint decides every offset up front
-    let nodata_text = params.nodata.map(nodata_text);
-    let layouts: Vec<IfdLayout> = all_tile_data
+    let tile_byte_counts: Vec<Vec<u32>> = all_tile_data
+        .iter()
+        .map(|tiles| tiles.iter().map(|tile| tile.len() as u32).collect())
+        .collect();
+    writer.write_all(&cog_header(&sizes, samples, params, &tile_byte_counts)?)?;
+    for tiles in all_tile_data.iter().rev() {
+        for tile in tiles {
+            writer.write_all(tile)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn write_cog_tiles<W: Write + Seek>(
+    width: usize,
+    height: usize,
+    samples: usize,
+    params: &CogParams,
+    mut tile_samples: impl FnMut(usize, usize, usize) -> Result<Vec<u8>, Error>,
+    writer: &mut W,
+) -> Result<(), Error> {
+    if samples == 0 || width == 0 || height == 0 {
+        return Err(Error::InvalidInput(
+            "a cog needs at least one band and one pixel".into(),
+        ));
+    }
+    check_nodata(params.format, params.nodata)?;
+    let sizes: Vec<(usize, usize)> = (0..=params.overview_levels)
+        .map(|level| (width.div_ceil(1 << level), height.div_ceil(1 << level)))
+        .collect();
+    let (tile_width, tile_height) = (params.tile_width as usize, params.tile_height as usize);
+    let tile_bytes = tile_width * tile_height * samples * params.format.bytes() as usize;
+    let header_bytes = 8 + ifd_layouts(&sizes, samples, params)
+        .iter()
+        .map(IfdLayout::total)
+        .sum::<usize>();
+    writer.seek(SeekFrom::Start(header_bytes as u64))?;
+    let mut tile_byte_counts: Vec<Vec<u32>> = vec![Vec::new(); sizes.len()];
+    for (level, &(level_width, level_height)) in sizes.iter().enumerate().rev() {
+        for tile_row in 0..level_height.div_ceil(tile_height) {
+            for tile_col in 0..level_width.div_ceil(tile_width) {
+                let raw = tile_samples(level, tile_col, tile_row)?;
+                if raw.len() != tile_bytes {
+                    return Err(Error::InvalidInput(format!(
+                        "tile {tile_col},{tile_row} of level {level} has {} bytes, expected {tile_bytes}",
+                        raw.len()
+                    )));
+                }
+                let tile = if params.deflate { deflated(&raw)? } else { raw };
+                writer.write_all(&tile)?;
+                tile_byte_counts[level].push(tile.len() as u32);
+            }
+        }
+    }
+    writer.seek(SeekFrom::Start(0))?;
+    writer.write_all(&cog_header(&sizes, samples, params, &tile_byte_counts)?)?;
+    Ok(())
+}
+
+fn deflated(tile: &[u8]) -> Result<Vec<u8>, io::Error> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(tile)?;
+    encoder.finish()
+}
+
+fn ifd_layouts(sizes: &[(usize, usize)], samples: usize, params: &CogParams) -> Vec<IfdLayout> {
+    let nodata = params.nodata.map(nodata_text);
+    sizes
         .iter()
         .enumerate()
-        .map(|(level, tiles)| IfdLayout {
+        .map(|(level, &(width, height))| IfdLayout {
             samples,
-            n_tiles: tiles.len(),
+            n_tiles: width.div_ceil(params.tile_width as usize)
+                * height.div_ceil(params.tile_height as usize),
             overview: level > 0,
-            nodata: nodata_text.clone(),
+            nodata: nodata.clone(),
         })
-        .collect();
+        .collect()
+}
+
+fn cog_header(
+    sizes: &[(usize, usize)],
+    samples: usize,
+    params: &CogParams,
+    tile_byte_counts: &[Vec<u32>],
+) -> Result<Vec<u8>, Error> {
+    // per-ifd byte footprint decides every offset up front
+    let layouts = ifd_layouts(sizes, samples, params);
     let mut ifd_starts = Vec::with_capacity(layouts.len());
     let mut at = 8usize;
     for layout in &layouts {
@@ -263,13 +340,11 @@ fn write_bands<W: Write>(
 
     // a viewer reading coarse-to-fine wants the small levels first, and the
     // cog spec requires that order
-    let mut tile_offsets: Vec<Vec<u32>> = vec![Vec::new(); all_tile_data.len()];
-    let mut tile_byte_counts: Vec<Vec<u32>> = vec![Vec::new(); all_tile_data.len()];
-    for level in (0..all_tile_data.len()).rev() {
-        for tile in &all_tile_data[level] {
+    let mut tile_offsets: Vec<Vec<u32>> = vec![Vec::new(); sizes.len()];
+    for level in (0..sizes.len()).rev() {
+        for &count in &tile_byte_counts[level] {
             tile_offsets[level].push(at as u32);
-            tile_byte_counts[level].push(tile.len() as u32);
-            at += tile.len();
+            at += count as usize;
         }
     }
     if at > u32::MAX as usize {
@@ -278,55 +353,28 @@ fn write_bands<W: Write>(
         ));
     }
 
-    writer.write_all(b"II")?;
-    write_u16(writer, 42)?;
-    write_u32(writer, 8)?;
-
-    for i in 0..all_tile_data.len() {
-        let (level_width, level_height, pixel_width, pixel_height) = if i == 0 {
-            (
-                width as u32,
-                height as u32,
-                params.pixel_width,
-                params.pixel_height,
-            )
-        } else {
-            let ov = &overviews[i - 1];
-            (
-                ov.width as u32,
-                ov.height as u32,
-                params.pixel_width * ov.factor as f64,
-                params.pixel_height * ov.factor as f64,
-            )
-        };
-        let next = if i + 1 < ifd_starts.len() {
-            ifd_starts[i + 1] as u32
-        } else {
-            0
-        };
+    let mut header = Vec::new();
+    header.extend_from_slice(b"II");
+    push_u16(&mut header, 42);
+    push_u32(&mut header, 8);
+    for (level, &(width, height)) in sizes.iter().enumerate() {
+        let factor = f64::from(1u32 << level);
         let ifd = build_ifd(&IfdArgs {
-            base: ifd_starts[i] as u32,
-            width: level_width,
-            height: level_height,
-            layout: &layouts[i],
-            pixel_width,
-            pixel_height,
+            base: ifd_starts[level] as u32,
+            width: width as u32,
+            height: height as u32,
+            layout: &layouts[level],
+            pixel_width: params.pixel_width * factor,
+            pixel_height: params.pixel_height * factor,
             params,
-            tile_offsets: &tile_offsets[i],
-            tile_byte_counts: &tile_byte_counts[i],
-            next_ifd_offset: next,
+            tile_offsets: &tile_offsets[level],
+            tile_byte_counts: &tile_byte_counts[level],
+            next_ifd_offset: ifd_starts.get(level + 1).map_or(0, |&start| start as u32),
         });
-        debug_assert_eq!(ifd.len(), layouts[i].total());
-        writer.write_all(&ifd)?;
+        debug_assert_eq!(ifd.len(), layouts[level].total());
+        header.extend_from_slice(&ifd);
     }
-
-    for tiles in all_tile_data.iter().rev() {
-        for tile in tiles {
-            writer.write_all(tile)?;
-        }
-    }
-
-    Ok(())
+    Ok(header)
 }
 
 /// Serve a specific tile from a COG-structured raster.
@@ -750,14 +798,6 @@ fn push_entry(buf: &mut Vec<u8>, tag: u16, data_type: u16, count: u32, value: u3
     push_u32(buf, value);
 }
 
-fn write_u16<W: Write>(writer: &mut W, v: u16) -> Result<(), io::Error> {
-    writer.write_all(&v.to_le_bytes())
-}
-
-fn write_u32<W: Write>(writer: &mut W, v: u32) -> Result<(), io::Error> {
-    writer.write_all(&v.to_le_bytes())
-}
-
 /// byte-range access to a COG, the seam between the reader and its
 /// transport. implement it over an http client with `Range` requests to
 /// stream remote files, the reader never asks for more than it needs
@@ -831,12 +871,25 @@ pub struct CogLevel {
     bits: u32,
     format: u32,
     nodata: Option<f64>,
+    mask: Option<TransparencyMask>,
 }
 
 impl CogLevel {
     fn tiles_across(&self) -> usize {
         self.width.div_ceil(self.tile_width)
     }
+}
+
+#[derive(Debug, Clone)]
+struct TransparencyMask {
+    width: usize,
+    height: usize,
+    tile_width: usize,
+    tile_height: usize,
+    tile_offsets: Vec<u64>,
+    tile_byte_counts: Vec<u64>,
+    compression: u16,
+    bits: u32,
 }
 
 /// windowed cog reader over a [`RangeRead`] source.
@@ -850,6 +903,171 @@ pub struct CogReader<R: RangeRead> {
     meta: GeoTiffMetadata,
 }
 
+fn tile_array<R: RangeRead>(
+    source: &R,
+    block: &[u8],
+    count: usize,
+    tag: u16,
+) -> Result<Vec<u64>, Error> {
+    let Some(entry) = block[..count * 12]
+        .chunks_exact(12)
+        .find(|entry| u16::from_le_bytes([entry[0], entry[1]]) == tag)
+    else {
+        return Ok(Vec::new());
+    };
+    // libtiff writes TileByteCounts as SHORT for deflate tiles under 6553 uncompressed bytes
+    let value_bytes: usize = match u16::from_le_bytes([entry[2], entry[3]]) {
+        3 => 2,
+        4 => 4,
+        other => {
+            return Err(Error::Format(format!(
+                "tag {tag} has tiff type {other}, expected SHORT or LONG"
+            )));
+        }
+    };
+    let array_bytes = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as usize * value_bytes;
+    let bytes = if array_bytes <= 4 {
+        entry[8..8 + array_bytes].to_vec()
+    } else {
+        let at = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+        source.read_range(u64::from(at), array_bytes as u64)?
+    };
+    Ok(bytes
+        .chunks_exact(value_bytes)
+        .map(|value| {
+            let mut widened = [0u8; 8];
+            widened[..value_bytes].copy_from_slice(value);
+            u64::from_le_bytes(widened)
+        })
+        .collect())
+}
+
+fn parse_mask_ifd<R: RangeRead>(
+    source: &R,
+    block: &[u8],
+    count: usize,
+) -> Result<TransparencyMask, Error> {
+    let tag_value = |tag: u16, default: u32| -> u32 {
+        block[..count * 12]
+            .chunks_exact(12)
+            .find(|entry| u16::from_le_bytes([entry[0], entry[1]]) == tag)
+            .map_or(default, |entry| {
+                u32::from_le_bytes(entry[8..12].try_into().unwrap())
+            })
+    };
+    let samples = tag_value(277, 1);
+    let bits = tag_value(258, 1);
+    let compression = tag_value(259, 1);
+    let predictor = tag_value(317, 1);
+    let fill_order = tag_value(266, 1);
+    // gdal CreateMaskBand only writes one sample with no predictor and the default fill order
+    let supported = samples == 1
+        && matches!(bits, 1 | 8)
+        && matches!(compression, 1 | 8)
+        && predictor == 1
+        && fill_order == 1;
+    if !supported {
+        return Err(Error::Format(format!(
+            "transparency mask ifd has {samples} samples of {bits} bits, compression \
+             {compression}, predictor {predictor} and fill order {fill_order}, and CogReader \
+             reads one 1 or 8 bit sample, uncompressed or deflate, with no predictor and fill \
+             order 1"
+        )));
+    }
+    Ok(TransparencyMask {
+        width: tag_value(256, 0) as usize,
+        height: tag_value(257, 0) as usize,
+        tile_width: tag_value(322, 0) as usize,
+        tile_height: tag_value(323, 0) as usize,
+        tile_offsets: tile_array(source, block, count, 324)?,
+        tile_byte_counts: tile_array(source, block, count, 325)?,
+        compression: compression as u16,
+        bits,
+    })
+}
+
+fn attach_masks(levels: &mut [CogLevel], masks: Vec<TransparencyMask>) -> Result<(), Error> {
+    if !masks.is_empty() && masks.len() != levels.len() {
+        return Err(Error::Format(format!(
+            "tiff has {} transparency mask ifds for {} levels, and CogReader applies masks only \
+             when every level has one",
+            masks.len(),
+            levels.len()
+        )));
+    }
+    // gdal cog files list overview mask ifds after every overview image ifd
+    for mask in masks {
+        let level = levels
+            .iter_mut()
+            .find(|level| {
+                level.mask.is_none() && level.width == mask.width && level.height == mask.height
+            })
+            .ok_or_else(|| {
+                Error::Format(format!(
+                    "transparency mask ifd of {}x{} pixels matches no image level",
+                    mask.width, mask.height
+                ))
+            })?;
+        let tiles = level.tiles_across() * level.height.div_ceil(level.tile_height);
+        let same_tiles = mask.tile_width == level.tile_width
+            && mask.tile_height == level.tile_height
+            && mask.tile_offsets.len() == tiles
+            && mask.tile_byte_counts.len() == tiles;
+        if !same_tiles {
+            return Err(Error::Format(format!(
+                "transparency mask ifd of {}x{} pixels does not share the tile grid of its level",
+                mask.width, mask.height
+            )));
+        }
+        level.mask = Some(mask);
+    }
+    Ok(())
+}
+
+fn decompressed_tile(compression: u16, bytes: Vec<u8>, expected: usize) -> Result<Vec<u8>, Error> {
+    let raw = match compression {
+        1 => bytes,
+        8 => {
+            use std::io::Read;
+            let mut out = Vec::with_capacity(expected);
+            flate2::read::ZlibDecoder::new(bytes.as_slice()).read_to_end(&mut out)?;
+            out
+        }
+        other => return Err(Error::Format(format!("compression {other} unsupported"))),
+    };
+    if raw.len() != expected {
+        return Err(Error::Format(format!(
+            "tile decoded to {} bytes, expected {expected}",
+            raw.len()
+        )));
+    }
+    Ok(raw)
+}
+
+fn blank_masked_pixels(
+    l: &CogLevel,
+    mask: &TransparencyMask,
+    stored: Vec<u8>,
+    values: &mut [f64],
+) -> Result<(), Error> {
+    let row_bytes = (l.tile_width * mask.bits as usize).div_ceil(8);
+    let opacity = decompressed_tile(mask.compression, stored, row_bytes * l.tile_height)?;
+    for (pixel, pixel_samples) in values.chunks_exact_mut(l.samples).enumerate() {
+        let (row, col) = (pixel / l.tile_width, pixel % l.tile_width);
+        let row_start = row * row_bytes;
+        // tiff fill order 1 packs the leftmost pixel into the high bit of each byte
+        let opaque = if mask.bits == 1 {
+            opacity[row_start + col / 8] & (0x80u8 >> (col % 8)) != 0
+        } else {
+            opacity[row_start + col] != 0
+        };
+        if !opaque {
+            pixel_samples.fill(f64::NAN);
+        }
+    }
+    Ok(())
+}
+
 impl<R: RangeRead> CogReader<R> {
     pub fn open(source: R) -> Result<Self, Error> {
         let header = source.read_range(0, 8)?;
@@ -860,20 +1078,32 @@ impl<R: RangeRead> CogReader<R> {
             header[4], header[5], header[6], header[7],
         ]));
         let mut levels = Vec::new();
+        let mut masks = Vec::new();
         let mut meta: Option<GeoTiffMetadata> = None;
         while next != 0 {
-            let count = u16::from_le_bytes(source.read_range(next, 2)?.try_into().unwrap()) as u64;
-            let block = source.read_range(next + 2, count * 12 + 4)?;
-            let (level, level_meta, following) = parse_ifd(&source, &block, count as usize)?;
-            levels.push(level);
-            if meta.is_none() {
-                meta = Some(level_meta);
+            let count =
+                u16::from_le_bytes(source.read_range(next, 2)?.try_into().unwrap()) as usize;
+            let block = source.read_range(next + 2, count as u64 * 12 + 4)?;
+            next = u64::from(u32::from_le_bytes(
+                block[count * 12..count * 12 + 4].try_into().unwrap(),
+            ));
+            // tiff NewSubfileType bit 2 marks transparency masks
+            let is_mask = block[..count * 12].chunks_exact(12).any(|entry| {
+                u16::from_le_bytes([entry[0], entry[1]]) == 254
+                    && u32::from_le_bytes(entry[8..12].try_into().unwrap()) & 4 != 0
+            });
+            if is_mask {
+                masks.push(parse_mask_ifd(&source, &block, count)?);
+                continue;
             }
-            next = following;
+            let (level, level_meta) = parse_ifd(&source, &block, count, levels.first())?;
+            levels.push(level);
+            meta = meta.or(level_meta);
         }
         if levels.is_empty() {
             return Err(Error::Format("tiff has no ifd".into()));
         }
+        attach_masks(&mut levels, masks)?;
         Ok(CogReader {
             source,
             levels,
@@ -941,18 +1171,44 @@ impl<R: RangeRead> CogReader<R> {
             let last_row = (row0 + rows - 1).min(l.height - 1);
             let mut tiles = Vec::new();
             let mut ranges = Vec::new();
+            let mut mask_ranges = Vec::new();
             for tr in row0 / l.tile_height..=last_row / l.tile_height {
                 for tc in col0 / l.tile_width..=last_col / l.tile_width {
                     let idx = tr * l.tiles_across() + tc;
+                    if let Some(mask) = &l.mask {
+                        // gdal reads mask tiles with no bytes as all zero
+                        if mask.tile_byte_counts[idx] == 0 {
+                            continue;
+                        }
+                        mask_ranges.push((mask.tile_offsets[idx], mask.tile_byte_counts[idx]));
+                    }
                     tiles.push((tc, tr));
-                    ranges.push((l.tile_offsets[idx], l.tile_byte_counts[idx]));
+                    if l.tile_byte_counts[idx] != 0 {
+                        ranges.push((l.tile_offsets[idx], l.tile_byte_counts[idx]));
+                    }
                 }
             }
+            let stored_image_count = ranges.len();
+            ranges.extend(mask_ranges);
             // one call for every touched tile, so a multiplexing
             // transport fetches them concurrently
-            let fetched = self.source.read_ranges(&ranges)?;
-            for ((tc, tr), bytes) in tiles.into_iter().zip(fetched) {
-                let values = decode_tile(&l, bytes)?;
+            let mut fetched = self.source.read_ranges(&ranges)?;
+            let mut stored_masks = fetched.split_off(stored_image_count).into_iter();
+            let mut stored_images = fetched.into_iter();
+            // gdal NullBlock fills image tiles with no bytes with nodata, or zero without one
+            let sparse_value = if l.nodata.is_some() { f64::NAN } else { 0.0 };
+            for (tc, tr) in tiles {
+                let mut values = if l.tile_byte_counts[tr * l.tiles_across() + tc] == 0 {
+                    vec![sparse_value; l.tile_width * l.tile_height * l.samples]
+                } else {
+                    let bytes = stored_images
+                        .next()
+                        .expect("read_ranges returns one result per range");
+                    decode_tile(&l, bytes)?
+                };
+                if let (Some(mask), Some(stored)) = (&l.mask, stored_masks.next()) {
+                    blank_masked_pixels(&l, mask, stored, &mut values)?;
+                }
                 for (band, plane) in out.iter_mut().enumerate() {
                     copy_tile(&values, &l, band, tc, tr, col0, row0, cols, rows, plane);
                 }
@@ -978,22 +1234,7 @@ impl<R: RangeRead> CogReader<R> {
 fn decode_tile(l: &CogLevel, bytes: Vec<u8>) -> Result<Vec<f64>, Error> {
     let sample = (l.bits / 8) as usize;
     let expected = l.tile_width * l.tile_height * l.samples * sample;
-    let mut raw = match l.compression {
-        1 => bytes,
-        8 => {
-            use std::io::Read;
-            let mut out = Vec::with_capacity(expected);
-            flate2::read::ZlibDecoder::new(bytes.as_slice()).read_to_end(&mut out)?;
-            out
-        }
-        other => return Err(Error::Format(format!("compression {other} unsupported"))),
-    };
-    if raw.len() != expected {
-        return Err(Error::Format(format!(
-            "tile decoded to {} bytes, expected {expected}",
-            raw.len()
-        )));
-    }
+    let mut raw = decompressed_tile(l.compression, bytes, expected)?;
     match l.predictor {
         1 => {}
         2 => undo_horizontal(&mut raw, l.tile_width * l.samples, l.samples, l.bits),
@@ -1166,7 +1407,8 @@ fn parse_ifd<R: RangeRead>(
     source: &R,
     block: &[u8],
     count: usize,
-) -> Result<(CogLevel, GeoTiffMetadata, u64), Error> {
+    full_resolution: Option<&CogLevel>,
+) -> Result<(CogLevel, Option<GeoTiffMetadata>), Error> {
     let entry_u16 = |off: usize| u16::from_le_bytes(block[off..off + 2].try_into().unwrap());
     let entry_u32 = |off: usize| u32::from_le_bytes(block[off..off + 4].try_into().unwrap());
 
@@ -1175,7 +1417,6 @@ fn parse_ifd<R: RangeRead>(
     let (mut predictor, mut planar) = (1u32, 1u32);
     let mut bits_entry = ShortList::default();
     let mut format_entry = ShortList::default();
-    let (mut offsets_at, mut counts_at, mut n_tiles) = (0u32, 0u32, 0usize);
     let (mut scale_at, mut tiepoint_at) = (0u32, 0u32);
     let (mut geokeys_at, mut geokeys_count) = (0u32, 0u32);
     let (mut nodata_at, mut nodata_count) = (0u32, 0u32);
@@ -1196,11 +1437,6 @@ fn parse_ifd<R: RangeRead>(
             317 => predictor = value & 0xffff,
             322 => tile_w = value as usize,
             323 => tile_h = value as usize,
-            324 => {
-                offsets_at = value;
-                n_tiles = entry_count as usize;
-            }
-            325 => counts_at = value,
             339 => format_entry = ShortList::at(block, e, entry_count),
             33550 => scale_at = value,
             33922 => tiepoint_at = value,
@@ -1296,63 +1532,48 @@ fn parse_ifd<R: RangeRead>(
         None
     };
 
-    let read_u32s = |source: &R, at: u32, n: usize| -> Result<Vec<u64>, Error> {
-        let bytes = source.read_range(u64::from(at), n as u64 * 4)?;
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|c| u64::from(u32::from_le_bytes(c.try_into().unwrap())))
-            .collect())
-    };
-    let (tile_offsets, tile_byte_counts) = if n_tiles <= 1 {
-        (vec![u64::from(offsets_at)], vec![u64::from(counts_at)])
-    } else {
-        (
-            read_u32s(source, offsets_at, n_tiles)?,
-            read_u32s(source, counts_at, n_tiles)?,
-        )
-    };
+    let tile_offsets = tile_array(source, block, count, 324)?;
+    let tile_byte_counts = tile_array(source, block, count, 325)?;
     let expected_tiles = width.div_ceil(tile_w) * height.div_ceil(tile_h);
-    if tile_offsets.len() != expected_tiles {
+    if tile_offsets.len() != expected_tiles || tile_byte_counts.len() != expected_tiles {
         return Err(Error::Format(format!(
-            "tile count {} does not match image geometry ({expected_tiles})",
-            tile_offsets.len()
+            "{} tile offsets and {} tile byte counts do not match image geometry \
+             ({expected_tiles} tiles)",
+            tile_offsets.len(),
+            tile_byte_counts.len()
         )));
     }
 
-    let f64_at =
-        |bytes: &[u8], off: usize| f64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-    let scale = source.read_range(u64::from(scale_at), 24)?;
-    let tiepoint = source.read_range(u64::from(tiepoint_at), 48)?;
-    let pixel_width = f64_at(&scale, 0);
-    let pixel_height = f64_at(&scale, 8);
-
-    let mut epsg = 0u16;
-    if geokeys_count >= 8 {
-        let keys = source.read_range(u64::from(geokeys_at), u64::from(geokeys_count) * 2)?;
-        let key_u16 = |off: usize| u16::from_le_bytes(keys[off..off + 2].try_into().unwrap());
-        let num_keys = key_u16(6) as usize;
-        for k in 0..num_keys {
-            let base = 8 + k * 8;
-            if base + 8 > keys.len() {
-                break;
+    let (pixel_width, pixel_height, meta) = match full_resolution {
+        None => {
+            if scale_at == 0 || tiepoint_at == 0 {
+                return Err(Error::Format(
+                    "full resolution ifd has no ModelPixelScale and ModelTiepoint tags".into(),
+                ));
             }
-            let key_id = key_u16(base);
-            if key_id == 2048 || key_id == 3072 {
-                epsg = key_u16(base + 6);
-            }
+            let scale = source.read_range(u64::from(scale_at), 24)?;
+            let tiepoint = source.read_range(u64::from(tiepoint_at), 48)?;
+            let geo_keys = if geokeys_count == 0 {
+                Vec::new()
+            } else {
+                source.read_range(u64::from(geokeys_at), u64::from(geokeys_count) * 2)?
+            };
+            let meta = geo_metadata(&scale, &tiepoint, &geo_keys);
+            (meta.pixel_width, meta.pixel_height, Some(meta))
         }
-    }
-
-    let meta = GeoTiffMetadata {
-        origin_x: f64_at(&tiepoint, 24),
-        origin_y: f64_at(&tiepoint, 32),
-        pixel_width,
-        pixel_height,
-        epsg,
+        Some(_) if scale_at != 0 => {
+            let scale = source.read_range(u64::from(scale_at), 24)?;
+            let scale_along =
+                |off: usize| f64::from_le_bytes(scale[off..off + 8].try_into().unwrap());
+            (scale_along(0), scale_along(8), None)
+        }
+        // gdal writes no ModelPixelScale on overview ifds
+        Some(full) => (
+            full.pixel_width * full.width as f64 / width as f64,
+            full.pixel_height * full.height as f64 / height as f64,
+            None,
+        ),
     };
-    let next = u64::from(u32::from_le_bytes(
-        block[count * 12..count * 12 + 4].try_into().unwrap(),
-    ));
     Ok((
         CogLevel {
             width,
@@ -1369,9 +1590,9 @@ fn parse_ifd<R: RangeRead>(
             bits,
             format,
             nodata,
+            mask: None,
         },
         meta,
-        next,
     ))
 }
 
@@ -1519,6 +1740,78 @@ mod tests {
         write_cog(&raster, &params, &mut buf).unwrap();
         let bytes = buf.into_inner();
         assert_eq!(&bytes[0..2], b"II");
+    }
+
+    #[test]
+    fn writing_tile_by_tile_matches_the_in_memory_writer() {
+        let (width, height) = (37, 21);
+        let second: Vec<f64> = (0..width * height).map(|i| (i % 251) as f64).collect();
+        let bands = BandedRaster::new(vec![
+            test_raster(width, height),
+            Raster::from_vec(width, height, second, 1.0, f64::NAN).unwrap(),
+        ])
+        .unwrap();
+        let params = CogParams {
+            tile_width: 16,
+            tile_height: 16,
+            overview_levels: 2,
+            deflate: true,
+            nodata: Some(0.0),
+            format: SampleFormat::U16,
+            ..CogParams::default()
+        };
+        let mut in_memory = io::Cursor::new(Vec::new());
+        write_cog_bands(&bands, &params, &mut in_memory).unwrap();
+
+        let per_band: Vec<Vec<Overview>> = bands
+            .bands()
+            .iter()
+            .map(|band| generate_overviews(band, params.overview_levels))
+            .collect();
+        let mut requested = Vec::new();
+        let mut streamed = io::Cursor::new(Vec::new());
+        write_cog_tiles(
+            width,
+            height,
+            2,
+            &params,
+            |level, tile_col, tile_row| {
+                requested.push(level);
+                let (planes, level_width, level_height): (Vec<&[f64]>, usize, usize) = if level == 0
+                {
+                    (
+                        bands.bands().iter().map(|b| b.data()).collect(),
+                        width,
+                        height,
+                    )
+                } else {
+                    let overview = &per_band[0][level - 1];
+                    (
+                        per_band
+                            .iter()
+                            .map(|b| b[level - 1].data.as_slice())
+                            .collect(),
+                        overview.width,
+                        overview.height,
+                    )
+                };
+                let tiles = bands_to_tiles(
+                    &planes,
+                    level_width,
+                    level_height,
+                    16,
+                    16,
+                    params.format,
+                    params.nodata,
+                )?;
+                Ok(tiles[tile_row * level_width.div_ceil(16) + tile_col].clone())
+            },
+            &mut streamed,
+        )
+        .unwrap();
+
+        assert_eq!(streamed.into_inner(), in_memory.into_inner());
+        assert_eq!(requested, vec![2, 1, 1, 0, 0, 0, 0, 0, 0]);
     }
 
     struct RecordingReader<'a> {
@@ -2635,6 +2928,744 @@ mod tests {
                 &format!("band {b}"),
             );
         }
+    }
+
+    const GDAL_SHAPED_TILE_SIDE: u32 = 64;
+    const GDAL_SHAPED_ORIGIN: (f64, f64) = (7.0, 47.0);
+    const GDAL_SHAPED_SCALE: (f64, f64) = (0.5, 0.25);
+    const PIXEL_IS_AREA: u16 = 1;
+    const PIXEL_IS_POINT: u16 = 2;
+
+    struct GdalShapedIfd {
+        width: u32,
+        height: u32,
+        new_subfile_type: u32,
+        bits: u32,
+        sample: u8,
+    }
+
+    fn gdal_image(width: u32, height: u32, new_subfile_type: u32, sample: u8) -> GdalShapedIfd {
+        GdalShapedIfd {
+            width,
+            height,
+            new_subfile_type,
+            bits: 8,
+            sample,
+        }
+    }
+
+    fn gdal_mask(width: u32, height: u32, new_subfile_type: u32, bits: u32) -> GdalShapedIfd {
+        GdalShapedIfd {
+            width,
+            height,
+            new_subfile_type,
+            bits,
+            sample: 255,
+        }
+    }
+
+    fn build_gdal_shaped_tiff(ifds: &[GdalShapedIfd], raster_type: u16) -> Vec<u8> {
+        let side = GDAL_SHAPED_TILE_SIDE;
+        let entries_of = |index: usize, ifd: &GdalShapedIfd| -> u32 {
+            let geo_entries = if index == 0 { 3 } else { 0 };
+            11 + u32::from(ifd.new_subfile_type != 0) + geo_entries
+        };
+        let ifd_bytes: Vec<u32> = ifds
+            .iter()
+            .enumerate()
+            .map(|(index, ifd)| {
+                let geo_bytes = if index == 0 { GEO_BYTES as u32 } else { 0 };
+                2 + entries_of(index, ifd) * 12 + 4 + geo_bytes
+            })
+            .collect();
+        let tile_bytes = |ifd: &GdalShapedIfd| side * side * ifd.bits / 8;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        push_u16(&mut buf, 42);
+        push_u32(&mut buf, 8);
+        let mut tile_at = 8 + ifd_bytes.iter().sum::<u32>();
+        for (index, ifd) in ifds.iter().enumerate() {
+            let start = buf.len() as u32;
+            let entries = entries_of(index, ifd);
+            let is_mask = ifd.new_subfile_type & 4 != 0;
+            push_u16(&mut buf, entries as u16);
+            if ifd.new_subfile_type != 0 {
+                push_entry(&mut buf, 254, 4, 1, ifd.new_subfile_type);
+            }
+            push_entry(&mut buf, 256, 3, 1, ifd.width);
+            push_entry(&mut buf, 257, 3, 1, ifd.height);
+            push_entry(&mut buf, 258, 3, 1, ifd.bits);
+            push_entry(&mut buf, 259, 3, 1, 1);
+            push_entry(&mut buf, 262, 3, 1, if is_mask { 4 } else { 1 });
+            push_entry(&mut buf, 277, 3, 1, 1);
+            push_entry(&mut buf, 322, 3, 1, side);
+            push_entry(&mut buf, 323, 3, 1, side);
+            push_entry(&mut buf, 324, 4, 1, tile_at);
+            push_entry(&mut buf, 325, 4, 1, tile_bytes(ifd));
+            push_entry(&mut buf, 339, 3, 1, 1);
+            tile_at += tile_bytes(ifd);
+            let aux = start + 2 + entries * 12 + 4;
+            // gdal GTIFFWriteDirectory writes no geo tags on overview and mask ifds
+            if index == 0 {
+                push_entry(&mut buf, 33550, 12, 3, aux);
+                push_entry(&mut buf, 33922, 12, 6, aux + 24);
+                push_entry(&mut buf, 34735, 3, GEO_KEY_SHORTS as u32, aux + 72);
+            }
+            let is_last = index + 1 == ifds.len();
+            push_u32(&mut buf, if is_last { 0 } else { start + ifd_bytes[index] });
+            if index == 0 {
+                for v in [GDAL_SHAPED_SCALE.0, GDAL_SHAPED_SCALE.1, 0.0] {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                let (x, y) = GDAL_SHAPED_ORIGIN;
+                for v in [0.0, 0.0, 0.0, x, y, 0.0] {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in [
+                    1,
+                    1,
+                    0,
+                    3,
+                    1024,
+                    0,
+                    1,
+                    2,
+                    1025,
+                    0,
+                    1,
+                    raster_type,
+                    2048,
+                    0,
+                    1,
+                    4326,
+                ] {
+                    push_u16(&mut buf, v);
+                }
+            }
+        }
+        for ifd in ifds {
+            buf.resize(buf.len() + tile_bytes(ifd) as usize, ifd.sample);
+        }
+        buf
+    }
+
+    #[test]
+    fn overviews_without_a_scale_tag_are_sized_from_the_full_image_and_selected() {
+        let tiff = build_gdal_shaped_tiff(
+            &[
+                gdal_image(64, 64, 0, 10),
+                gdal_image(32, 32, 1, 20),
+                gdal_image(16, 16, 1, 30),
+            ],
+            PIXEL_IS_AREA,
+        );
+        let reader = CogReader::open(tiff.as_slice()).unwrap();
+        let widths: Vec<f64> = reader.levels().iter().map(|l| l.pixel_width).collect();
+        let heights: Vec<f64> = reader.levels().iter().map(|l| l.pixel_height).collect();
+        assert_eq!(widths, vec![0.5, 1.0, 2.0]);
+        assert_eq!(heights, vec![0.25, 0.5, 1.0]);
+
+        assert_eq!(reader.select_level(0.5), 0);
+        assert_eq!(reader.select_level(1.4), 1);
+        assert_eq!(reader.select_level(100.0), 2);
+        let window = reader
+            .read_window(reader.select_level(1.4), 0, 0, 4, 4)
+            .unwrap();
+        assert_eq!(window.data(), &[20.0; 16]);
+    }
+
+    #[test]
+    fn untagged_overview_pixel_size_is_the_ratio_of_the_dimensions_on_each_axis() {
+        let tiff = build_gdal_shaped_tiff(
+            &[gdal_image(33, 21, 0, 10), gdal_image(17, 11, 1, 20)],
+            PIXEL_IS_AREA,
+        );
+        let reader = CogReader::open(tiff.as_slice()).unwrap();
+        let overview = &reader.levels()[1];
+        assert_close(
+            &[overview.pixel_width, overview.pixel_height],
+            &[0.5 * 33.0 / 17.0, 0.25 * 21.0 / 11.0],
+            "overview pixel size",
+        );
+    }
+
+    #[test]
+    fn uncompressed_masks_of_either_bit_depth_apply_to_their_own_level() {
+        for mask_bits in [1, 8] {
+            let tiff = build_gdal_shaped_tiff(
+                &[
+                    gdal_image(64, 64, 0, 10),
+                    GdalShapedIfd {
+                        sample: 0,
+                        ..gdal_mask(64, 64, 4, mask_bits)
+                    },
+                    gdal_image(32, 32, 1, 20),
+                    gdal_mask(32, 32, 5, mask_bits),
+                ],
+                PIXEL_IS_AREA,
+            );
+            let reader = CogReader::open(tiff.as_slice()).unwrap();
+            assert_eq!(reader.levels().len(), 2, "{mask_bits} bit");
+            let full = reader.read_window(0, 0, 0, 4, 4).unwrap();
+            assert!(
+                full.data().iter().all(|value| value.is_nan()),
+                "{mask_bits} bit"
+            );
+            let overview = reader.read_window(1, 0, 0, 4, 4).unwrap();
+            assert_eq!(overview.data(), &[20.0; 16], "{mask_bits} bit");
+        }
+    }
+
+    #[test]
+    fn open_refuses_masks_it_cannot_apply_to_every_level() {
+        let full_image = || gdal_image(64, 64, 0, 10);
+        let overview_image = || gdal_image(32, 32, 1, 20);
+        let refused = [
+            (
+                "overview mask only",
+                vec![full_image(), overview_image(), gdal_mask(32, 32, 5, 1)],
+            ),
+            (
+                "full resolution mask only",
+                vec![full_image(), gdal_mask(64, 64, 4, 1), overview_image()],
+            ),
+            (
+                "mask matching no level",
+                vec![full_image(), gdal_mask(40, 40, 4, 1)],
+            ),
+            (
+                "mask of four bits",
+                vec![full_image(), gdal_mask(64, 64, 4, 4)],
+            ),
+        ];
+        for (case, ifds) in refused {
+            let err = open_err(&build_gdal_shaped_tiff(&ifds, PIXEL_IS_AREA));
+            assert!(err.contains("mask"), "{case}: {err}");
+        }
+    }
+
+    const MASKED_COG_GHOST_AREA: &[u8] = b"GDAL_STRUCTURAL_METADATA_SIZE=000174 bytes\n\
+        LAYOUT=IFDS_BEFORE_DATA\nBLOCK_ORDER=ROW_MAJOR\nBLOCK_LEADER=SIZE_AS_UINT4\n\
+        BLOCK_TRAILER=LAST_4_BYTES_REPEATED\nKNOWN_INCOMPATIBLE_EDITION=NO\n\
+        MASK_INTERLEAVED_WITH_IMAGERY=YES\n";
+
+    struct MaskedCogLevel {
+        width: u32,
+        height: u32,
+        side: u32,
+        samples: u32,
+        mask_bits: u32,
+        image_tiles: Vec<Vec<u8>>,
+        mask_tiles: Vec<Vec<u8>>,
+    }
+
+    struct MaskedCogIfd<'a> {
+        width: u32,
+        height: u32,
+        side: u32,
+        new_subfile_type: u32,
+        samples: u32,
+        bits: u32,
+        tiles: &'a [Vec<u8>],
+    }
+
+    impl MaskedCogLevel {
+        fn image_ifd(&self, overview: bool) -> MaskedCogIfd<'_> {
+            MaskedCogIfd {
+                width: self.width,
+                height: self.height,
+                side: self.side,
+                new_subfile_type: u32::from(overview),
+                samples: self.samples,
+                bits: 8,
+                tiles: &self.image_tiles,
+            }
+        }
+
+        fn mask_ifd(&self, overview: bool) -> MaskedCogIfd<'_> {
+            MaskedCogIfd {
+                width: self.width,
+                height: self.height,
+                side: self.side,
+                new_subfile_type: 4 | u32::from(overview),
+                samples: 1,
+                bits: self.mask_bits,
+                tiles: &self.mask_tiles,
+            }
+        }
+    }
+
+    impl MaskedCogIfd<'_> {
+        fn entries(&self, first: bool) -> u32 {
+            13 + u32::from(self.new_subfile_type != 0) + if first { 3 } else { 0 }
+        }
+
+        fn byte_count_bytes(&self) -> u32 {
+            let tile_bytes = (self.side * self.bits * self.samples).div_ceil(8) * self.side;
+            // libtiff _WriteAsType allows SHORT counts for deflate tiles under this size
+            if self.tiles.len() > 1 && tile_bytes < 0xFFFF / 10 {
+                2
+            } else {
+                4
+            }
+        }
+
+        fn offset_array_bytes(&self) -> u32 {
+            if self.tiles.len() > 1 {
+                self.tiles.len() as u32 * 4
+            } else {
+                0
+            }
+        }
+
+        fn count_array_bytes(&self) -> u32 {
+            let bytes = self.tiles.len() as u32 * self.byte_count_bytes();
+            if bytes > 4 { bytes } else { 0 }
+        }
+    }
+
+    fn build_masked_cog(levels: &[MaskedCogLevel]) -> Vec<u8> {
+        let (full, overviews) = levels.split_first().unwrap();
+        let mut ifds = vec![full.image_ifd(false), full.mask_ifd(false)];
+        ifds.extend(overviews.iter().map(|level| level.image_ifd(true)));
+        ifds.extend(overviews.iter().map(|level| level.mask_ifd(true)));
+        let image_at = |level: usize| if level == 0 { 0 } else { level + 1 };
+        let mask_at = |level: usize| if level == 0 { 1 } else { level + levels.len() };
+
+        let stored: Vec<Vec<Vec<u8>>> = ifds
+            .iter()
+            .map(|ifd| {
+                ifd.tiles
+                    .iter()
+                    .map(|tile| {
+                        if tile.is_empty() {
+                            Vec::new()
+                        } else {
+                            zlib(tile)
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let first_directory = 8 + MASKED_COG_GHOST_AREA.len() as u32;
+        let mut at = first_directory;
+        let mut directory_starts = Vec::new();
+        for (index, ifd) in ifds.iter().enumerate() {
+            directory_starts.push(at);
+            let geo_bytes = if index == 0 { GEO_BYTES as u32 } else { 0 };
+            at += 2 + ifd.entries(index == 0) * 12 + 4 + geo_bytes;
+        }
+        let mut array_starts = Vec::new();
+        for ifd in &ifds {
+            array_starts.push(at);
+            at += ifd.offset_array_bytes() + ifd.count_array_bytes();
+        }
+
+        let mut tile_offsets: Vec<Vec<u32>> = vec![Vec::new(); ifds.len()];
+        let mut tile_data = Vec::new();
+        for level in (0..levels.len()).rev() {
+            let (image_tiles, mask_tiles) = (&stored[image_at(level)], &stored[mask_at(level)]);
+            assert_eq!(image_tiles.len(), mask_tiles.len());
+            for (image_tile, mask_tile) in image_tiles.iter().zip(mask_tiles) {
+                for (ifd_index, payload) in
+                    [(image_at(level), image_tile), (mask_at(level), mask_tile)]
+                {
+                    if payload.is_empty() {
+                        tile_offsets[ifd_index].push(0);
+                        continue;
+                    }
+                    push_u32(&mut tile_data, payload.len() as u32);
+                    tile_offsets[ifd_index].push(at + tile_data.len() as u32);
+                    tile_data.extend_from_slice(payload);
+                    tile_data.extend_from_slice(&payload[payload.len() - 4..]);
+                }
+            }
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        push_u16(&mut buf, 42);
+        push_u32(&mut buf, first_directory);
+        buf.extend_from_slice(MASKED_COG_GHOST_AREA);
+        for (index, ifd) in ifds.iter().enumerate() {
+            let first = index == 0;
+            let entries = ifd.entries(first);
+            let tile_count = ifd.tiles.len() as u32;
+            let per_sample = |value: u32| {
+                if ifd.samples == 2 {
+                    value | (value << 16)
+                } else {
+                    value
+                }
+            };
+            let offsets_value = if tile_count == 1 {
+                tile_offsets[index][0]
+            } else {
+                array_starts[index]
+            };
+            let counts_value = if ifd.count_array_bytes() > 0 {
+                array_starts[index] + ifd.offset_array_bytes()
+            } else {
+                stored[index]
+                    .iter()
+                    .rev()
+                    .fold(0u32, |value, tile| (value << 16) | tile.len() as u32)
+            };
+            let count_type = if ifd.byte_count_bytes() == 2 { 3 } else { 4 };
+            let is_mask = ifd.new_subfile_type & 4 != 0;
+
+            push_u16(&mut buf, entries as u16);
+            if ifd.new_subfile_type != 0 {
+                push_entry(&mut buf, 254, 4, 1, ifd.new_subfile_type);
+            }
+            push_entry(&mut buf, 256, 3, 1, ifd.width);
+            push_entry(&mut buf, 257, 3, 1, ifd.height);
+            push_entry(&mut buf, 258, 3, ifd.samples, per_sample(ifd.bits));
+            push_entry(&mut buf, 259, 3, 1, 8);
+            push_entry(&mut buf, 262, 3, 1, if is_mask { 4 } else { 1 });
+            push_entry(&mut buf, 277, 3, 1, ifd.samples);
+            push_entry(&mut buf, 284, 3, 1, 1);
+            push_entry(&mut buf, 317, 3, 1, 1);
+            push_entry(&mut buf, 322, 3, 1, ifd.side);
+            push_entry(&mut buf, 323, 3, 1, ifd.side);
+            push_entry(&mut buf, 324, 4, tile_count, offsets_value);
+            push_entry(&mut buf, 325, count_type, tile_count, counts_value);
+            push_entry(&mut buf, 339, 3, ifd.samples, per_sample(1));
+            let aux = directory_starts[index] + 2 + entries * 12 + 4;
+            if first {
+                push_entry(&mut buf, 33550, 12, 3, aux);
+                push_entry(&mut buf, 33922, 12, 6, aux + 24);
+                push_entry(&mut buf, 34735, 3, GEO_KEY_SHORTS as u32, aux + 72);
+            }
+            push_u32(
+                &mut buf,
+                directory_starts.get(index + 1).copied().unwrap_or(0),
+            );
+            if first {
+                for v in [GDAL_SHAPED_SCALE.0, GDAL_SHAPED_SCALE.1, 0.0] {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                let (x, y) = GDAL_SHAPED_ORIGIN;
+                for v in [0.0, 0.0, 0.0, x, y, 0.0] {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in [
+                    1,
+                    1,
+                    0,
+                    3,
+                    1024,
+                    0,
+                    1,
+                    2,
+                    1025,
+                    0,
+                    1,
+                    PIXEL_IS_AREA,
+                    2048,
+                    0,
+                    1,
+                    4326,
+                ] {
+                    push_u16(&mut buf, v);
+                }
+            }
+        }
+        for (index, ifd) in ifds.iter().enumerate() {
+            if ifd.offset_array_bytes() > 0 {
+                for &offset in &tile_offsets[index] {
+                    push_u32(&mut buf, offset);
+                }
+            }
+            if ifd.count_array_bytes() > 0 {
+                for tile in &stored[index] {
+                    if ifd.byte_count_bytes() == 2 {
+                        push_u16(&mut buf, tile.len() as u16);
+                    } else {
+                        push_u32(&mut buf, tile.len() as u32);
+                    }
+                }
+            }
+        }
+        buf.extend_from_slice(&tile_data);
+        buf
+    }
+
+    fn masked_cog_value(col: u32, row: u32, sample: u32) -> u8 {
+        ((col + 3 * row + 50 * sample) % 200 + 1) as u8
+    }
+
+    fn masked_cog_level(
+        (width, height): (u32, u32),
+        samples: u32,
+        mask_bits: u32,
+        opaque: impl Fn(u32, u32) -> bool,
+    ) -> MaskedCogLevel {
+        let side = 32;
+        let row_bytes = (side * mask_bits).div_ceil(8) as usize;
+        let mut image_tiles = Vec::new();
+        let mut mask_tiles = Vec::new();
+        for tile_row in 0..height.div_ceil(side) {
+            for tile_col in 0..width.div_ceil(side) {
+                let mut image_tile = Vec::new();
+                let mut mask_tile = vec![0u8; row_bytes * side as usize];
+                for y in 0..side {
+                    for x in 0..side {
+                        let (col, row) = (tile_col * side + x, tile_row * side + y);
+                        for sample in 0..samples {
+                            image_tile.push(masked_cog_value(col, row, sample));
+                        }
+                        if !opaque(col, row) {
+                            continue;
+                        }
+                        let row_start = y as usize * row_bytes;
+                        if mask_bits == 1 {
+                            mask_tile[row_start + x as usize / 8] |= 0x80u8 >> (x % 8);
+                        } else {
+                            mask_tile[row_start + x as usize] = 255;
+                        }
+                    }
+                }
+                image_tiles.push(image_tile);
+                mask_tiles.push(mask_tile);
+            }
+        }
+        MaskedCogLevel {
+            width,
+            height,
+            side,
+            samples,
+            mask_bits,
+            image_tiles,
+            mask_tiles,
+        }
+    }
+
+    fn assert_masked_window<R: RangeRead>(
+        reader: &CogReader<R>,
+        level: usize,
+        (col0, row0, cols, rows): (usize, usize, usize, usize),
+        opaque: impl Fn(u32, u32) -> bool,
+    ) {
+        let window = reader
+            .read_window_bands(level, col0, row0, cols, rows)
+            .unwrap();
+        for band in 0..window.band_count() {
+            let data = window.band(band).unwrap().data();
+            for row in 0..rows {
+                for col in 0..cols {
+                    let (x, y) = ((col0 + col) as u32, (row0 + row) as u32);
+                    let got = data[row * cols + col];
+                    if opaque(x, y) {
+                        let want = f64::from(masked_cog_value(x, y, band as u32));
+                        assert_eq!(got, want, "level {level} band {band} at {x},{y}");
+                    } else {
+                        assert!(got.is_nan(), "level {level} band {band} at {x},{y}: {got}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gdal_cog_layout_masks_every_band_of_every_level() {
+        let full_opaque = |col: u32, row: u32| (col + row) % 3 != 0;
+        let first_overview_opaque = |col: u32, _row: u32| col % 2 == 0;
+        let second_overview_opaque = |_col: u32, row: u32| row % 5 != 0;
+        for mask_bits in [1, 8] {
+            let tiff = build_masked_cog(&[
+                masked_cog_level((96, 64), 2, mask_bits, full_opaque),
+                masked_cog_level((48, 32), 2, mask_bits, first_overview_opaque),
+                masked_cog_level((24, 16), 2, mask_bits, second_overview_opaque),
+            ]);
+            let chain = ifd_chain(&tiff);
+            let subfile_types: Vec<Option<u32>> = chain.iter().map(|ifd| ifd.value(254)).collect();
+            assert_eq!(
+                subfile_types,
+                vec![None, Some(4), Some(1), Some(1), Some(5), Some(5)]
+            );
+
+            let reader = CogReader::open(tiff.as_slice()).unwrap();
+            let widths: Vec<f64> = reader.levels().iter().map(|l| l.pixel_width).collect();
+            assert_eq!(widths, vec![0.5, 1.0, 2.0]);
+            assert_masked_window(&reader, 0, (0, 0, 96, 64), full_opaque);
+            assert_masked_window(&reader, 0, (28, 28, 8, 8), full_opaque);
+            assert_masked_window(&reader, 1, (0, 0, 48, 32), first_overview_opaque);
+            assert_masked_window(&reader, 2, (0, 0, 24, 16), second_overview_opaque);
+        }
+    }
+
+    #[test]
+    fn small_tile_byte_counts_stored_as_short_address_the_right_tiles() {
+        let tiff = build_masked_cog(&[
+            masked_cog_level((96, 64), 1, 1, |col, _row| col < 40),
+            masked_cog_level((48, 32), 1, 1, |_col, row| row < 10),
+        ]);
+        let chain = ifd_chain(&tiff);
+        let count_types: Vec<u16> = chain.iter().map(|ifd| ifd.entry(325).unwrap().0).collect();
+        assert_eq!(count_types, vec![3, 3, 3, 3]);
+
+        let reader = CogReader::open(tiff.as_slice()).unwrap();
+        assert_masked_window(&reader, 0, (0, 0, 96, 64), |col, _row| col < 40);
+        assert_masked_window(&reader, 1, (0, 0, 48, 32), |_col, row| row < 10);
+    }
+
+    #[test]
+    fn a_masked_window_fetches_only_the_image_and_mask_tiles_it_touches() {
+        let tiff = build_masked_cog(&[masked_cog_level((96, 64), 1, 1, |col, _row| col < 40)]);
+        let reader = CogReader::open(RecordingReader {
+            data: tiff.as_slice(),
+            fetched: Cell::new(0),
+        })
+        .unwrap();
+        let level = &reader.levels()[0];
+        let mask = level.mask.as_ref().unwrap();
+        let tile_bytes = (level.tile_byte_counts[4] + mask.tile_byte_counts[4]) as usize;
+
+        let before = reader.source.fetched.get();
+        assert_masked_window(&reader, 0, (33, 33, 4, 4), |col, _row| col < 40);
+        assert_eq!(reader.source.fetched.get() - before, tile_bytes);
+    }
+
+    struct NoEmptyRanges<'a>(&'a [u8]);
+
+    impl RangeRead for NoEmptyRanges<'_> {
+        fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
+            assert_ne!(len, 0, "empty range at {offset}");
+            self.0.read_range(offset, len)
+        }
+    }
+
+    #[test]
+    fn a_sparse_mask_tile_masks_its_pixels_without_a_fetch() {
+        let mut level = masked_cog_level((96, 64), 1, 1, |_col, _row| true);
+        level.image_tiles[1] = Vec::new();
+        level.mask_tiles[1] = Vec::new();
+        let tiff = build_masked_cog(&[level]);
+        let reader = CogReader::open(NoEmptyRanges(tiff.as_slice())).unwrap();
+
+        let outside_sparse_tile = |col: u32, row: u32| !((32..64).contains(&col) && row < 32);
+        assert_masked_window(&reader, 0, (0, 0, 96, 64), outside_sparse_tile);
+        assert_masked_window(&reader, 0, (32, 0, 32, 32), outside_sparse_tile);
+    }
+
+    #[test]
+    fn a_sparse_image_tile_under_a_stored_mask_reads_as_zero_where_opaque() {
+        let opaque = |col: u32, _row: u32| col % 2 == 0;
+        let mut level = masked_cog_level((96, 64), 1, 1, opaque);
+        level.image_tiles[1] = Vec::new();
+        let tiff = build_masked_cog(&[level]);
+        let reader = CogReader::open(NoEmptyRanges(tiff.as_slice())).unwrap();
+        let window = reader.read_window(0, 0, 0, 96, 64).unwrap();
+        for (index, &got) in window.data().iter().enumerate() {
+            let (row, col) = ((index / 96) as u32, (index % 96) as u32);
+            if !opaque(col, row) {
+                assert!(got.is_nan(), "{col},{row}: {got}");
+            } else if (32..64).contains(&col) && row < 32 {
+                assert_eq!(got, 0.0, "{col},{row}");
+            } else {
+                assert_eq!(got, f64::from(masked_cog_value(col, row, 0)), "{col},{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unmasked_sparse_tile_reads_as_nodata_or_zero_without_a_fetch() {
+        let window_of = |bits: u32, format: u32, nodata: Option<&str>| -> Vec<f64> {
+            let tiff = build_test_tiff(16, 16, bits, format, 8, 1, nodata, &[]);
+            let reader = CogReader::open(NoEmptyRanges(tiff.as_slice())).unwrap();
+            reader.read_window(0, 0, 0, 16, 16).unwrap().data().to_vec()
+        };
+        assert_eq!(window_of(8, 1, None), vec![0.0; 256]);
+        assert_eq!(window_of(32, 3, None), vec![0.0; 256]);
+        for (bits, format, nodata) in [(8, 1, "255"), (32, 3, "-9999"), (32, 3, "nan")] {
+            let window = window_of(bits, format, Some(nodata));
+            assert!(window.iter().all(|value| value.is_nan()), "{nodata}");
+        }
+    }
+
+    fn blank_image_tile(tiff: &mut [u8], tile: usize) {
+        let chain = ifd_chain(tiff);
+        for tag in [324, 325] {
+            let (_, _, array_at) = chain[0].entry(tag).unwrap();
+            let at = array_at as usize + tile * 4;
+            tiff[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn sparse_tiles_leave_the_stored_tiles_around_them_in_place() {
+        for nodata in [None, Some(-1.0)] {
+            let mut tiff = write_cog_with(&test_raster(32, 32), nodata);
+            blank_image_tile(&mut tiff, 1);
+            let reader = CogReader::open(NoEmptyRanges(tiff.as_slice())).unwrap();
+            let window = reader.read_window(0, 0, 0, 32, 32).unwrap();
+            for (index, &got) in window.data().iter().enumerate() {
+                let (row, col) = (index / 32, index % 32);
+                match (row < 16 && col >= 16, nodata) {
+                    (false, _) => assert_eq!(got, index as f64, "{col},{row}"),
+                    (true, None) => assert_eq!(got, 0.0, "{col},{row}"),
+                    (true, Some(_)) => assert!(got.is_nan(), "{col},{row}: {got}"),
+                }
+            }
+        }
+    }
+
+    fn set_tiepoint_raster_position(tiff: &mut [u8], raster_i: f64, raster_j: f64) {
+        let tiepoint_at = ifd_chain(tiff)[0].value(33922).unwrap() as usize;
+        tiff[tiepoint_at..tiepoint_at + 8].copy_from_slice(&raster_i.to_le_bytes());
+        tiff[tiepoint_at + 8..tiepoint_at + 16].copy_from_slice(&raster_j.to_le_bytes());
+    }
+
+    #[test]
+    fn tiepoint_raster_position_moves_the_cog_origin_to_the_first_pixel() {
+        let images = [gdal_image(64, 64, 0, 10)];
+
+        let mut area = build_gdal_shaped_tiff(&images, PIXEL_IS_AREA);
+        set_tiepoint_raster_position(&mut area, 10.0, 4.0);
+        let reader = CogReader::open(area.as_slice()).unwrap();
+        assert_eq!(reader.meta().origin_x, 2.0);
+        assert_eq!(reader.meta().origin_y, 48.0);
+
+        let mut point = build_gdal_shaped_tiff(&images, PIXEL_IS_POINT);
+        set_tiepoint_raster_position(&mut point, 10.0, 4.0);
+        let reader = CogReader::open(point.as_slice()).unwrap();
+        assert_eq!(reader.meta().origin_x, 1.75);
+        assert_eq!(reader.meta().origin_y, 48.125);
+    }
+
+    #[test]
+    fn pixel_is_point_moves_the_cog_origin_and_pixel_is_area_does_not() {
+        let images = [gdal_image(64, 64, 0, 10), gdal_image(32, 32, 1, 20)];
+
+        let point = build_gdal_shaped_tiff(&images, PIXEL_IS_POINT);
+        let reader = CogReader::open(point.as_slice()).unwrap();
+        assert_eq!(reader.meta().origin_x, 6.75);
+        assert_eq!(reader.meta().origin_y, 47.125);
+        assert_eq!(reader.meta().pixel_width, 0.5);
+        assert_eq!(reader.meta().pixel_height, 0.25);
+        assert_eq!(reader.meta().epsg, 4326);
+
+        let area = build_gdal_shaped_tiff(&images, PIXEL_IS_AREA);
+        let reader = CogReader::open(area.as_slice()).unwrap();
+        assert_eq!(reader.meta().origin_x, 7.0);
+        assert_eq!(reader.meta().origin_y, 47.0);
+    }
+
+    #[test]
+    fn a_full_resolution_ifd_without_geo_tags_is_an_error() {
+        let mut tiff = build_gdal_shaped_tiff(&[gdal_image(64, 64, 0, 10)], PIXEL_IS_AREA);
+        let chain = ifd_chain(&tiff);
+        let entry = chain[0].offset as usize + 2;
+        let scale_entry = (0..chain[0].entries.len())
+            .map(|i| entry + i * 12)
+            .find(|&at| u16_at(&tiff, at) == 33550)
+            .unwrap();
+        tiff[scale_entry..scale_entry + 2].copy_from_slice(&33551u16.to_le_bytes());
+        let err = open_err(&tiff);
+        assert!(err.contains("ModelPixelScale"), "{err}");
     }
 
     #[test]
